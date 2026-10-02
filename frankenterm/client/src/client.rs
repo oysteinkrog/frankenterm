@@ -20292,7 +20292,7 @@ mod tests {
         ] {
             let name = pdu.pdu_name();
             process_unilateral(&authority, unilateral(pdu)).unwrap_or_else(|err| {
-                panic!("a request-only client must ignore {name}, got {err:#}")
+                panic!("a request-only client must ignore {}, got {:#}", name, err)
             });
         }
     }
