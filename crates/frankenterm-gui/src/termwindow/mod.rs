@@ -7300,11 +7300,14 @@ impl TermWindow {
         let Some(mux) = self.mux_or_log("reload GUI configuration") else {
             return;
         };
-        let window = match mux.get_window(self.mux_window_id) {
-            Some(window) => window,
+        // Release the `mux.windows` read guard at once: the rest of this
+        // function reaches code that read-locks it again (see
+        // update_title_impl), which deadlocks against a queued writer.
+        let single_tab = match mux.get_window(self.mux_window_id) {
+            Some(window) => window.len() == 1,
             _ => return,
         };
-        if window.len() == 1 {
+        if single_tab {
             self.show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
         } else {
             self.show_tab_bar = config.enable_tab_bar;
@@ -7586,8 +7589,12 @@ impl TermWindow {
         let Some(mux) = self.mux_or_log("update window title") else {
             return;
         };
-        let window = match mux.get_window(self.mux_window_id) {
-            Some(window) => window,
+        // Read the tab count and release the `mux.windows` read guard at once.
+        // get_tab_information takes the same guard again, and parking_lot's
+        // RwLock blocks a second read while a writer waits, so holding this
+        // guard across it deadlocks against any `mux.windows.write()`.
+        let num_tabs = match mux.get_window(self.mux_window_id) {
+            Some(window) => window.len(),
             _ => return,
         };
         let tabs = self.get_tab_information();
@@ -7675,11 +7682,9 @@ impl TermWindow {
             }
         }
 
-        let num_tabs = window.len();
         if num_tabs == 0 {
             return;
         }
-        drop(window);
 
         let title = match config::run_immediate_with_lua_config(|lua| {
             if let Some(lua) = lua {
