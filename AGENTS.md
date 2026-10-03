@@ -459,6 +459,15 @@ locally`, `no admissible workers`, `worker=null`, `local fallback`, or any other
 path that did not reach a remote worker, stop the proof lane and mark the bead
 blocked with the exact RCH reason. Do not count local Cargo output as proof.
 
+**Machines without `rch` (local builds).** When `rch` is not installed, do not
+copy the `env CARGO_TARGET_DIR=/tmp/ft-<bead>-*` part of the commands above.
+`/tmp` is often tmpfs (RAM), and one target dir per agent fills the local disk:
+on 2026-10-02 eleven of them added about 200 GiB in a day on one desktop. Use
+the machine's build wrapper and the checkout's own `target/` instead, for
+example `heavy-build cargo check --workspace --all-targets`. Follow the
+machine's own agent instructions (`~/.claude/CLAUDE.md`) where they say more.
+A local run is still not remote proof under the rule above.
+
 Static release gates (no Cargo) live in one script and are what the DSR
 quality lane runs; there is no GitHub workflow (Rule 0.1):
 
@@ -1111,6 +1120,9 @@ Either tighten the threshold to `commits-1h ≤ 4` to match observed
 reality, or rely on the per-pane convergence signal.
 
 ### Rule SO-6: Disk pressure is manageable with per-agent target dirs + completion cleanup
+
+This rule assumes remote `rch` workers. On a machine that builds locally, see
+"Machines without `rch`" under Compiler Checks: no per-agent target dirs there.
 
 Each agent uses a unique `/tmp/ft-swarm-<slug>-target` (or
 `/tmp/ft-<slug>-target`) so cargo locks don't contend. The 2026-04-27
