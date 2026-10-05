@@ -7486,6 +7486,457 @@ mod tests {
         assert!(mux.get_tab(live_tab_id).is_some());
     }
 
+    // Ported from fork/pr/floating-reconcile-closed-tabs (#116), unchanged.
+    #[test]
+    fn snapshot_without_a_closed_tab_drops_it_and_keeps_the_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_031);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        let mut two_tabs = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut second) = two_tabs.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        second.tab_id = 52;
+        second.pane_id = 62;
+        two_tabs.tabs.push(PaneNode::Leaf(second));
+        two_tabs.tab_titles.push("second tab".to_string());
+
+        ClientDomain::process_pane_list(&mux, Arc::clone(&inner), two_tabs, None)
+            .expect("two-tab topology should attach");
+        let window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let closed_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab should map locally");
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        // The server closed tab 52, and this snapshot arrives before the
+        // local PaneRemoved cleanup has dropped its mirror.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("a snapshot that omits a closed tab must apply, not reject the attachment");
+
+        assert!(mux.get_tab(closed_tab_id).is_none());
+        assert_eq!(inner.remote_to_local_tab_id(52), None);
+        assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+        let surviving_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("surviving remote tab should stay mapped");
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("window should survive")
+                .iter()
+                .map(|tab| tab.tab_id())
+                .collect::<Vec<_>>(),
+            vec![surviving_tab_id]
+        );
+    }
+
+    // The #116 test above with one added step: pane 62 is marked dead first,
+    // as the PaneRemoved handler does, because upstream only drops a tab whose
+    // panes are all dead. Every assertion is unchanged.
+    #[test]
+    fn snapshot_without_a_closed_tab_drops_it_and_keeps_the_window_once_its_pane_is_dead() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_031);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        let mut two_tabs = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut second) = two_tabs.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        second.tab_id = 52;
+        second.pane_id = 62;
+        two_tabs.tabs.push(PaneNode::Leaf(second));
+        two_tabs.tab_titles.push("second tab".to_string());
+
+        ClientDomain::process_pane_list(&mux, Arc::clone(&inner), two_tabs, None)
+            .expect("two-tab topology should attach");
+        let window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let closed_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab should map locally");
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        // The server closed tab 52, and this snapshot arrives before the
+        // local PaneRemoved cleanup has dropped its mirror.
+        let closed_pane = mux
+            .get_pane(
+                inner
+                    .remote_to_local_pane_id(&mux, 62)
+                    .expect("remote pane 62 should map locally"),
+            )
+            .expect("closed pane is still registered");
+        closed_pane
+            .downcast_ref::<ClientPane>()
+            .expect("client pane")
+            .renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .dead = true;
+        drop(closed_pane);
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("a snapshot that omits a closed tab must apply, not reject the attachment");
+
+        assert!(mux.get_tab(closed_tab_id).is_none());
+        assert_eq!(inner.remote_to_local_tab_id(52), None);
+        assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+        let surviving_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("surviving remote tab should stay mapped");
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("window should survive")
+                .iter()
+                .map(|tab| tab.tab_id())
+                .collect::<Vec<_>>(),
+            vec![surviving_tab_id]
+        );
+    }
+
+    // Ported from fork/pr/move-tab-to-window (#111) at 113f8781. Only
+    // change: resolve_remote_window is upstream's remote_window_for_local_window.
+    fn listing_with_panes(placements: &[(WindowId, TabId, PaneId)]) -> ListPanesResponse {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        listing.tabs.clear();
+        listing.tab_titles.clear();
+        listing.window_titles.clear();
+        for &(window_id, tab_id, pane_id) in placements {
+            let mut entry = template.clone();
+            entry.window_id = window_id;
+            entry.tab_id = tab_id;
+            entry.pane_id = pane_id;
+            listing.tabs.push(PaneNode::Leaf(entry));
+            listing.tab_titles.push(format!("tab {tab_id}"));
+            listing
+                .window_titles
+                .insert(window_id, format!("window {window_id}"));
+        }
+        listing
+    }
+
+    #[test]
+    fn spawn_targets_the_remote_window_of_a_tab_moved_to_another_local_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_032);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("remote topology should attach");
+        let original_window = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote tab should map locally");
+
+        // A restored GUI layout moves the tab into a window of its own.
+        let layout_window = mux.new_empty_window(Some("ops".to_string()), None);
+        mux.move_tab_between_windows(tab_id, *layout_window, None)
+            .expect("move the tab into the layout window");
+        assert_ne!(*layout_window, original_window);
+        assert_eq!(inner.local_to_remote_window(*layout_window), None);
+
+        assert_eq!(
+            inner.remote_window_for_local_window(&mux, *layout_window),
+            Some(41),
+            "a tab spawned from the layout window must join remote window 41"
+        );
+        // Resolution only reads: the mapping of window 41 is not repointed,
+        // so another local window that shows window 41 keeps its mapping.
+        assert_eq!(inner.remote_to_local_window(41), Some(original_window));
+    }
+
+    #[test]
+    fn resolving_one_remote_window_keeps_another_remote_windows_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_035);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (42, 52, 62)]),
+            None,
+        )
+        .expect("two windows should attach");
+        let window_41 = inner.remote_to_local_window(41).expect("window 41 maps");
+        let tab_52 = inner.remote_to_local_tab_id(52).expect("tab 52 maps");
+
+        // A restored layout puts window 42's tab into window 41's local
+        // window, next to window 41's own tab, and makes it the active tab.
+        mux.move_tab_between_windows(tab_52, window_41, None)
+            .expect("move tab 52 into window 41's local window");
+        let index = mux
+            .get_window(window_41)
+            .expect("window 41 exists")
+            .idx_by_id(tab_52)
+            .expect("tab 52 is in window 41");
+        mux.activate_tab_at_index(window_41, index, true)
+            .expect("activate tab 52");
+
+        assert_eq!(inner.remote_window_for_local_window(&mux, window_41), Some(42));
+        assert_eq!(
+            inner.remote_to_local_window(41),
+            Some(window_41),
+            "resolving window 42 must not erase window 41's mapping"
+        );
+    }
+
+    #[test]
+    fn a_spawned_tab_lands_in_the_window_its_request_named() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_036);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("remote topology should attach");
+        let mapped_window = inner.remote_to_local_window(41).expect("window 41 maps");
+        let tab_51 = inner.remote_to_local_tab_id(51).expect("tab 51 maps");
+
+        // Two local windows show remote window 41: the mapped one keeps an
+        // extra tab, and the layout window holds tab 51. Two spawns into
+        // window 41 overlap, one from each local window.
+        let layout_window = mux.new_empty_window(Some("ops".to_string()), None);
+        let layout_window_id = *layout_window;
+        mux.move_tab_between_windows(tab_51, layout_window_id, None)
+            .expect("move tab 51 into the layout window");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (41, 53, 63), (41, 54, 64)]),
+            None,
+        )
+        .expect("the server reports both spawned tabs");
+        let tab_53 = mux
+            .get_tab(inner.remote_to_local_tab_id(53).expect("tab 53 maps"))
+            .expect("tab 53 mirror");
+        let tab_54 = mux
+            .get_tab(inner.remote_to_local_tab_id(54).expect("tab 54 maps"))
+            .expect("tab 54 mirror");
+
+        // Each operation places its own result by its own request.
+        place_tab_in_requested_window(&mux, &tab_53, layout_window_id)
+            .expect("place the layout window's spawn");
+        place_tab_in_requested_window(&mux, &tab_54, mapped_window)
+            .expect("place the mapped window's spawn");
+
+        assert_eq!(
+            mux.window_containing_tab(tab_53.tab_id()),
+            Some(layout_window_id)
+        );
+        assert_eq!(
+            mux.window_containing_tab(tab_54.tab_id()),
+            Some(mapped_window)
+        );
+        assert_eq!(mux.window_containing_tab(tab_51), Some(layout_window_id));
+    }
+
+    #[test]
+    fn spawn_from_a_window_without_client_tabs_uses_the_recorded_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_033);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        let empty = mux.new_empty_window(Some("ops".to_string()), None);
+        assert_eq!(inner.remote_window_for_local_window(&mux, *empty), None);
+        inner.record_remote_to_local_window_mapping(41, *empty);
+        assert_eq!(inner.remote_window_for_local_window(&mux, *empty), Some(41));
+    }
+
+    #[test]
+    fn snapshot_migrates_a_pane_the_server_moved_into_another_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_033);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (42, 52, 62)]),
+            None,
+        )
+        .expect("two windows should attach");
+        let moved_pane_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("pane 61 should map locally");
+        let moved_pane = mux.get_pane(moved_pane_id).expect("pane 61 is registered");
+        let source_window_id = inner.remote_to_local_window(41).expect("window 41 maps");
+        let target_window_id = inner.remote_to_local_window(42).expect("window 42 maps");
+        let source_tab_id = inner.remote_to_local_tab_id(51).expect("tab 51 maps");
+
+        // MovePaneToNewTab put pane 61 into a new tab 53 in window 42, and
+        // tab 51 and window 41 closed on the server.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(42, 52, 62), (42, 53, 61)]),
+            None,
+        )
+        .expect("a server-side pane move must apply, not reject the attachment");
+
+        let after = mux
+            .get_pane(moved_pane_id)
+            .expect("the moved pane keeps its local identity");
+        assert!(Arc::ptr_eq(&after, &moved_pane));
+        assert_eq!(
+            after
+                .downcast_ref::<ClientPane>()
+                .expect("client pane")
+                .remote_tab_id(),
+            53
+        );
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        let new_tab = mux.get_tab(new_tab_id).expect("tab 53 mirror exists");
+        assert!(new_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &moved_pane)));
+        assert_eq!(
+            mux.window_containing_tab(new_tab_id),
+            Some(target_window_id)
+        );
+        assert!(mux.get_tab(source_tab_id).is_none());
+        assert!(mux.get_window(source_window_id).is_none());
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_migrates_a_pane_the_server_moved_into_a_new_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_034);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (41, 52, 62)]),
+            None,
+        )
+        .expect("one window with two tabs should attach");
+        let moved_pane_id = inner.remote_to_local_pane_id(&mux, 61).expect("pane 61");
+        let moved_pane = mux.get_pane(moved_pane_id).expect("pane 61 is registered");
+        let source_window_id = inner.remote_to_local_window(41).expect("window 41 maps");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 52, 62), (43, 53, 61)]),
+            None,
+        )
+        .expect("a move into a new window must apply");
+
+        let after = mux.get_pane(moved_pane_id).expect("same local pane");
+        assert!(Arc::ptr_eq(&after, &moved_pane));
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        let new_window_id = inner.remote_to_local_window(43).expect("window 43 maps");
+        assert_ne!(new_window_id, source_window_id);
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(new_window_id));
+        let remaining_tab_id = inner.remote_to_local_tab_id(52).expect("tab 52 maps");
+        assert_eq!(
+            mux.window_containing_tab(remaining_tab_id),
+            Some(source_window_id)
+        );
+    }
+
+    #[test]
+    fn snapshot_maps_a_remote_window_to_the_local_window_holding_its_tabs() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_032);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("initial topology should attach");
+        let first_window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote tab should map locally");
+
+        // A restored layout moves the tab into another local window, and the
+        // window it left closes.
+        let restored = mux.new_empty_window(Some("ops".to_string()), None);
+        let restored_window_id = *restored;
+        mux.move_tab_between_windows(tab_id, restored_window_id, None)
+            .expect("move the tab into the restored window");
+        drop(restored);
+        mux.kill_window(first_window_id);
+        assert!(mux.get_window(first_window_id).is_none());
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("resync should apply");
+
+        assert_eq!(
+            inner.local_to_remote_window(restored_window_id),
+            Some(41),
+            "a spawn or tab move targeting the restored window must reach remote window 41"
+        );
+        assert_eq!(mux.window_containing_tab(tab_id), Some(restored_window_id));
+    }
+
     #[test]
     fn topology_resync_rejects_previous_attachment_tab_order_before_mutation() {
         for current in [false, true] {
