@@ -31128,6 +31128,126 @@ mod tests {
         Mux::shutdown();
     }
 
+    // Ported verbatim from fork/pr/close-dead-pane-tab (#115); only the
+    // names carry a ported_115_ prefix to avoid clashing with upstream's tests.
+    #[test]
+    fn ported_115_pane_reader_eof_with_close_removes_its_tab_and_window() {
+        struct GatedEofReader(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for GatedEofReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+
+        let guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        let (release_eof, gate) = std::sync::mpsc::channel();
+        let (pane, _) = KillCountingPane::new_with_reader(
+            224,
+            test_size(),
+            Some(Box::new(GatedEofReader(gate))),
+            false,
+        );
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::PaneRemoved(224)) {
+                let _ = removed_tx.send(());
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        let (tab, window_id) = register_attached_test_pane(&guard, &mux, &pane);
+        let tab_id = tab.tab_id();
+        drop(tab);
+        assert_eq!(Activity::count_for_mux(&mux), 0);
+
+        // The shell exits: the reader sees EOF with no activity live, so the
+        // EOF finalization's own prune is the only one that runs.
+        release_eof.send(()).expect("reader should be waiting for EOF");
+        removed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("EOF with exit_behavior=Close must deregister the pane");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mux.get_tab(tab_id).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            mux.get_tab(tab_id).is_none(),
+            "the dead pane's tab must close, not stay open with no pane registered"
+        );
+        assert!(mux.get_window(window_id).is_none());
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn ported_115_pane_reader_eof_while_another_lease_is_live_closes_the_tab_when_it_releases() {
+        struct GatedEofReader(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for GatedEofReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+
+        let guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        let (release_eof, gate) = std::sync::mpsc::channel();
+        let (pane, _) = KillCountingPane::new_with_reader(
+            225,
+            test_size(),
+            Some(Box::new(GatedEofReader(gate))),
+            false,
+        );
+        let (tab, window_id) = register_attached_test_pane(&guard, &mux, &pane);
+        let tab_id = tab.tab_id();
+        drop(tab);
+        assert_eq!(Activity::count_for_mux(&mux), 0);
+
+        // Another operation (an async search, say) holds a lease on the pane
+        // generation when the shell exits.
+        let generation = Arc::clone(
+            &mux.panes
+                .read()
+                .get(&225)
+                .expect("pane generation should be live")
+                .generation,
+        );
+        let other_operation = generation
+            .try_acquire()
+            .expect("live generation should admit an operation");
+
+        release_eof.send(()).expect("reader should be waiting for EOF");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while mux.get_pane(225).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            mux.get_pane(225).is_none(),
+            "EOF with exit_behavior=Close must deregister the pane"
+        );
+        assert!(
+            mux.get_tab(tab_id).is_some(),
+            "the live lease keeps the retired pane in its tab until it releases"
+        );
+
+        drop(other_operation);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mux.get_tab(tab_id).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            mux.get_tab(tab_id).is_none(),
+            "releasing the last lease must close the dead pane's tab"
+        );
+        assert!(mux.get_window(window_id).is_none());
+        Mux::shutdown();
+    }
+
     #[test]
     fn pane_reader_eof_scheduler_rejection_finalizes_exact_generation_inline() {
         let _guard = global_test_lock();
