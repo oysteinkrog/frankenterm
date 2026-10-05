@@ -562,6 +562,71 @@ mod tests {
         );
     }
 
+    // Ported from fork/pr/explicit-palette (#113). Upstream has no
+    // ConfigHandle::detached, so these drive desktop_palette_for_config with
+    // the same explicit-palette test config_with_accessibility_palette uses.
+    fn prefer_light() -> AccessibilityPreferences {
+        AccessibilityPreferences::new(
+            MotionPreference::NoPreference,
+            ContrastPreference::NoPreference,
+            ColorSchemePreference::Light,
+        )
+    }
+
+    fn config_with_background(background: &str) -> config::Config {
+        let palette = config::Palette {
+            background: Some(config::RgbaColor::try_from(background.to_string()).unwrap()),
+            ..Default::default()
+        };
+        let mut cfg = config::Config::default();
+        cfg.resolved_palette = palette;
+        cfg
+    }
+
+    fn config_with_preferences_palette(
+        cfg: &config::Config,
+        prefs: AccessibilityPreferences,
+    ) -> config::Palette {
+        let explicit_palette = cfg.colors.is_some() || cfg.color_scheme.is_some();
+        desktop_palette_for_config(&cfg.resolved_palette, explicit_palette, prefs)
+            .unwrap_or_else(|| cfg.resolved_palette.clone())
+    }
+
+    #[test]
+    fn explicit_colors_are_not_overlaid_by_desktop_preference() {
+        let mut cfg = config_with_background("#2e3440");
+        cfg.colors = Some(cfg.resolved_palette.clone());
+
+        let result = config_with_preferences_palette(&cfg, prefer_light());
+        assert_eq!(
+            result.background,
+            Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap())
+        );
+    }
+
+    #[test]
+    fn explicit_color_scheme_is_not_overlaid_by_desktop_preference() {
+        let mut cfg = config_with_background("#2e3440");
+        cfg.color_scheme = Some("Nord (Gogh)".to_string());
+
+        let result = config_with_preferences_palette(&cfg, prefer_light());
+        assert_eq!(
+            result.background,
+            Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap())
+        );
+    }
+
+    #[test]
+    fn default_palette_still_follows_desktop_preference() {
+        let cfg = config_with_background("#2e3440");
+
+        let result = config_with_preferences_palette(&cfg, prefer_light());
+        assert_eq!(
+            result.background,
+            Some(config::RgbaColor::try_from(LIGHT_PALETTE.background.to_string()).unwrap())
+        );
+    }
+
     #[test]
     fn non_standard_theme_class_overlays_live_config_palette() {
         let base = config::Palette {
