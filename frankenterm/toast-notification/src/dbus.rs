@@ -109,7 +109,7 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
     }
 
     let mut hints = HashMap::new();
-    hints.insert("urgency", Value::U8(2 /* Critical */));
+    hints.insert("urgency", Value::U8(TOAST_URGENCY));
     let action_label = notif.activation_label();
     let actions = if notif.has_activation_action() {
         vec!["show", action_label]
@@ -174,10 +174,17 @@ pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Normal urgency. Servers never expire a critical (2) notification: Plasma
+/// ignores expire_timeout for it, so every toast stayed on screen until it was
+/// clicked. Normal toasts close on time and still land in the history.
+const TOAST_URGENCY: u8 = 1;
+
+/// Milliseconds for the Notify call. No timeout means the server's default
+/// (-1), not 0, which asks the server to keep the toast up forever.
 fn dbus_expire_timeout(timeout: Option<Duration>) -> i32 {
     timeout
         .map(|duration| i32::try_from(duration.as_millis()).unwrap_or(i32::MAX))
-        .unwrap_or(0)
+        .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -185,8 +192,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dbus_expire_timeout_preserves_no_timeout() {
-        assert_eq!(dbus_expire_timeout(None), 0);
+    fn dbus_expire_timeout_uses_server_default_without_timeout() {
+        assert_eq!(dbus_expire_timeout(None), -1);
+    }
+
+    #[test]
+    fn toast_urgency_is_normal_so_timeouts_apply() {
+        assert_eq!(TOAST_URGENCY, 1);
     }
 
     #[test]

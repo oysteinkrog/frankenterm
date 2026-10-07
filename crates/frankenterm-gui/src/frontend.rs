@@ -1510,16 +1510,14 @@ impl GuiFrontEnd {
             .borrow_mut()
             .set(pane_id as u64, slug);
         self.apply_osc22_cursor_shape_for_pane(pane_id);
+        // No desktop popup: programs change the pointer shape often, and a toast
+        // for each change piled up on screen. The announcement goes to the log.
         if prior != Some(slug) {
-            persistent_toast_notification(
-                "Cursor shape changed",
-                osc22_accessibility_announcement(slug).as_str(),
+            log::debug!(
+                "OSC 22 cursor shape for pane {pane_id}: {}",
+                osc22_accessibility_announcement(slug)
             );
         }
-        log::debug!(
-            "OSC 22 cursor shape for pane {pane_id} is now {}",
-            slug.slug()
-        );
     }
 
     fn apply_osc22_cursor_shape_for_pane(&self, pane_id: mux::pane::PaneId) {
