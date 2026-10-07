@@ -12,6 +12,10 @@ use std::time::Duration;
 use zbus::proxy;
 use zvariant::{Type, Value};
 
+/// The app ID: the GUI's default window class, its desktop file name and its icon name.
+/// Matches `config::DEFAULT_WINDOW_CLASS`, which this crate cannot depend on.
+const APP_ID: &str = "com.dicklesworthstone.frankenterm";
+
 #[derive(Debug, Type, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ServerInformation {
@@ -110,6 +114,8 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
 
     let mut hints = HashMap::new();
     hints.insert("urgency", Value::U8(TOAST_URGENCY));
+    // Lets the notification server match the toast to the app's desktop file.
+    hints.insert("desktop-entry", Value::from(APP_ID));
     let action_label = notif.activation_label();
     let actions = if notif.has_activation_action() {
         vec!["show", action_label]
@@ -118,9 +124,9 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
     };
     let notification = proxy
         .notify(
-            "wezterm",
+            "FrankenTerm",
             0,
-            "org.wezfurlong.wezterm",
+            APP_ID,
             &notif.title,
             &notif.message,
             &actions,
