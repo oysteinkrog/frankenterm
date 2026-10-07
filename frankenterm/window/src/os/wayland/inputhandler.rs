@@ -231,8 +231,13 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
                     DeadKeyStatus::None,
                 ));
             }
-            TextInputEvent::Done { serial } => {
-                *state.last_serial.borrow_mut() = serial;
+            // The `done` serial counts this text_input object's commit requests
+            // (1, 2, 3, ...). It is not a wl_seat input serial, so it must not
+            // replace `last_serial`: wl_data_device.set_selection and the primary
+            // selection need a real seat serial, and KWin cancels the source when
+            // it gets this counter instead. Keyboard and pointer events keep
+            // `last_serial` current.
+            TextInputEvent::Done { serial: _ } => {
                 if let Some(text) = pending_state.commit.take() {
                     state.dispatch_to_focused_window(WindowEvent::KeyEvent(KeyEvent {
                         key: KeyCode::composed(&text),
