@@ -180,6 +180,41 @@ enum KeyRepeatTimerPlan {
     },
 }
 
+/// How long a paint waits for the compositor's frame callback before it goes
+/// ahead without it. KWin withholds frame callbacks from a surface while it
+/// is fully covered or on another desktop, and xdg-shell only applies an
+/// acked configure once the surface commits, so a window that waited forever
+/// stopped following resizes and kept stale content until something else made
+/// the compositor repaint it. A healthy compositor answers within one frame
+/// (16 ms at 60 Hz), so this never fires while the window is visible.
+const FRAME_CALLBACK_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Debug, PartialEq, Eq)]
+enum FrameWaitPlan {
+    /// Paint now. `discard_overdue` is true when a pending callback has
+    /// waited past the timeout and must be dropped first.
+    PaintNow { discard_overdue: bool },
+    /// A callback is pending and still fresh: defer the paint and wake
+    /// after `wait` in case the callback never comes.
+    Defer { wait: Duration },
+}
+
+/// Decide whether a paint may proceed. `pending_for` is how long the current
+/// frame callback has been outstanding, or None when none is pending.
+fn frame_wait_plan(pending_for: Option<Duration>, timeout: Duration) -> FrameWaitPlan {
+    match pending_for {
+        None => FrameWaitPlan::PaintNow {
+            discard_overdue: false,
+        },
+        Some(elapsed) if elapsed >= timeout => FrameWaitPlan::PaintNow {
+            discard_overdue: true,
+        },
+        Some(elapsed) => FrameWaitPlan::Defer {
+            wait: timeout - elapsed,
+        },
+    }
+}
+
 fn key_repeat_timer_plan(
     elapsed: Duration,
     next_due: Duration,
@@ -596,6 +631,8 @@ impl WaylandWindow {
             frame_callback: None,
             frame_callback_chain_depth: 0,
             frame_callback_chain_depth_peak: 0,
+            frame_callback_requested_at: None,
+            frame_wait_timer_armed: false,
 
             text_cursor: None,
             appearance,
@@ -1088,6 +1125,10 @@ pub struct WaylandWindowInner {
     /// Peak chain depth observed since window construction. Surfaced
     /// for the visual-regression harness (RQ-S* SLOs) and `ft doctor`.
     frame_callback_chain_depth_peak: u32,
+    /// When `frame_callback` was requested, for the timeout in `do_paint`.
+    frame_callback_requested_at: Option<Instant>,
+    /// A wake-up for `FRAME_CALLBACK_TIMEOUT` is already scheduled.
+    frame_wait_timer_armed: bool,
     invalidated: bool,
     // font_config: Rc<FontConfiguration>,
     text_cursor: Option<Rect>,
@@ -1662,6 +1703,10 @@ impl WaylandWindowInner {
                         }
                     }
                 }
+                // The configure was acked above and only takes effect once
+                // the surface commits, so do not let a frame callback the
+                // compositor may never send (covered surface) hold the paint.
+                self.discard_frame_callback("pending across a configure");
                 self.request_paint("configure");
             }
         }
@@ -1824,12 +1869,28 @@ impl WaylandWindowInner {
             return Ok(());
         }
 
-        if self.frame_callback.is_some() {
-            // Painting now won't be productive, so skip it but
-            // remember that we need to be painted so that when
-            // the compositor is ready for us, we can paint then.
-            self.invalidated = true;
-            return Ok(());
+        let pending_for = self.frame_callback.as_ref().map(|_| {
+            self.frame_callback_requested_at
+                .map(|at| at.elapsed())
+                .unwrap_or(Duration::ZERO)
+        });
+        match frame_wait_plan(pending_for, FRAME_CALLBACK_TIMEOUT) {
+            FrameWaitPlan::Defer { wait } => {
+                // Painting now won't be productive, so skip it but
+                // remember that we need to be painted so that when
+                // the compositor is ready for us, we can paint then.
+                // The wake-up covers a compositor that never answers,
+                // which KWin does while the surface is covered.
+                self.invalidated = true;
+                self.arm_frame_wait_timer(wait);
+                return Ok(());
+            }
+            FrameWaitPlan::PaintNow {
+                discard_overdue: true,
+            } => self.discard_frame_callback("overdue"),
+            FrameWaitPlan::PaintNow {
+                discard_overdue: false,
+            } => {}
         }
 
         // Ask the compositor to wake us up when its time to paint the next frame,
@@ -1847,6 +1908,7 @@ impl WaylandWindowInner {
 
         log::trace!("do_paint - callback: {:?}", callback);
         let prior = self.frame_callback.replace(callback);
+        self.frame_callback_requested_at = Some(Instant::now());
         // The structural guard at the top of this function should
         // make the prior callback always None here. Track the
         // chain depth so a Linux integration test can pin the
@@ -1907,6 +1969,7 @@ impl WaylandWindowInner {
 
     pub(crate) fn next_frame_is_ready(&mut self) {
         let prior = self.frame_callback.take();
+        self.frame_callback_requested_at = None;
         if prior.is_some() {
             // Decrement the chain-depth counter — pairs with the
             // increment after `surface().frame()` in `do_paint`.
@@ -1914,6 +1977,73 @@ impl WaylandWindowInner {
         }
         if self.invalidated {
             self.request_paint("frame callback");
+        }
+    }
+
+    /// Stop waiting for the pending frame callback. The compositor may still
+    /// send its `done` later; `next_frame_is_ready` then finds nothing to
+    /// take, or clears a newer callback early, which only costs one extra
+    /// paint.
+    fn discard_frame_callback(&mut self, reason: &str) {
+        if self.frame_callback.take().is_some() {
+            self.frame_callback_chain_depth = self.frame_callback_chain_depth.saturating_sub(1);
+            log::debug!("Wayland frame callback {reason}; painting without it");
+        }
+        self.frame_callback_requested_at = None;
+    }
+
+    /// Schedule one wake-up `wait` from now so a deferred paint is not lost
+    /// when the compositor never sends the frame callback. Idle windows never
+    /// get here: the timer is armed only when a paint was deferred, and it
+    /// runs once.
+    fn arm_frame_wait_timer(&mut self, wait: Duration) {
+        if self.frame_wait_timer_armed {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let window_id = SurfaceUserData::from_wl(window.wl_surface()).window_id;
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "Wayland frame callback timeout",
+        ) {
+            Ok(reservation) => {
+                self.frame_wait_timer_armed = true;
+                reservation
+                    .spawn(async move {
+                        promise::spawn::sleep(wait).await;
+                        WaylandConnection::with_window_inner(window_id, |inner| {
+                            inner.frame_wait_timer_fired();
+                            Ok(())
+                        });
+                    })
+                    .detach();
+            }
+            Err(rejected) => {
+                log::warn!(
+                    "Wayland frame callback timeout for window {window_id} was rejected by the main-thread scheduler: {rejected:?}"
+                );
+            }
+        }
+    }
+
+    fn frame_wait_timer_fired(&mut self) {
+        self.frame_wait_timer_armed = false;
+        if !self.invalidated || self.frame_callback.is_none() {
+            // The callback arrived in the meantime, or nothing is waiting.
+            return;
+        }
+        let pending_for = self
+            .frame_callback_requested_at
+            .map(|at| at.elapsed())
+            .unwrap_or(Duration::ZERO);
+        match frame_wait_plan(Some(pending_for), FRAME_CALLBACK_TIMEOUT) {
+            // A newer callback replaced the one we waited on; wait for that one.
+            FrameWaitPlan::Defer { wait } => self.arm_frame_wait_timer(wait),
+            // do_paint discards the overdue callback and paints.
+            FrameWaitPlan::PaintNow { .. } => self.request_paint("frame callback timeout"),
         }
     }
 
@@ -2671,6 +2801,42 @@ mod tests {
             assert!(!gap.is_zero());
             let rate = u32::try_from(rate).expect("test rates are positive");
             assert!(gap.as_millis() * u128::from(rate) >= 1_000);
+        }
+    }
+
+    #[test]
+    fn frame_wait_plan_paints_without_a_callback_and_defers_a_fresh_one() {
+        let timeout = Duration::from_millis(100);
+        assert_eq!(
+            frame_wait_plan(None, timeout),
+            FrameWaitPlan::PaintNow {
+                discard_overdue: false
+            }
+        );
+        assert_eq!(
+            frame_wait_plan(Some(Duration::ZERO), timeout),
+            FrameWaitPlan::Defer { wait: timeout }
+        );
+        assert_eq!(
+            frame_wait_plan(Some(Duration::from_millis(30)), timeout),
+            FrameWaitPlan::Defer {
+                wait: Duration::from_millis(70)
+            }
+        );
+    }
+
+    #[test]
+    fn frame_wait_plan_drops_an_overdue_callback() {
+        let timeout = Duration::from_millis(100);
+        // Exactly at the timeout and well past it: paint, and drop the callback
+        // the compositor withheld (KWin does this for a covered surface).
+        for elapsed in [timeout, Duration::from_secs(8)] {
+            assert_eq!(
+                frame_wait_plan(Some(elapsed), timeout),
+                FrameWaitPlan::PaintNow {
+                    discard_overdue: true
+                }
+            );
         }
     }
 
