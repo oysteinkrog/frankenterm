@@ -1917,6 +1917,7 @@ impl Config {
         if let Some(colors) = &cfg.colors {
             cfg.resolved_palette = cfg.resolved_palette.overlay_with(colors);
         }
+        cfg.resolved_palette = std::mem::take(&mut cfg.resolved_palette).with_tab_bar_from_scheme();
 
         if let Some(bg) = BackgroundLayer::with_legacy(self) {
             cfg.background.insert(0, bg);

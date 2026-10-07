@@ -182,6 +182,25 @@ pub struct Palette {
 impl_lua_conversion_dynamic!(Palette);
 
 impl Palette {
+    /// Fills in the tab bar colors this palette leaves unset from its background,
+    /// foreground and ANSI yellow, so the tab bar follows the color scheme. Tab bar
+    /// colors the scheme or the config set still win. A palette with no background
+    /// or foreground keeps the built-in tab bar colors.
+    pub fn with_tab_bar_from_scheme(mut self) -> Self {
+        let (Some(background), Some(foreground)) = (self.background, self.foreground) else {
+            return self;
+        };
+        let bell = self
+            .ansi
+            .map_or_else(|| (0xc0, 0x80, 0x00).into(), |ansi| ansi[3]);
+        let derived = TabBarColors::from_scheme_colors(background, foreground, bell);
+        self.tab_bar = Some(match &self.tab_bar {
+            Some(set) => derived.overlay_with(set),
+            None => derived,
+        });
+        self
+    }
+
     pub fn overlay_with(&self, other: &Self) -> Self {
         macro_rules! overlay {
             ($name:ident) => {
@@ -450,6 +469,45 @@ impl TabBarColors {
             .unwrap_or_else(default_inactive_tab_bell_hover)
     }
 
+    /// Tab bar colors built from a color scheme's background, foreground and bell
+    /// (yellow) colors, for a scheme that sets no tab bar colors of its own.
+    /// Inactive tabs use the terminal background, the bar behind them is a shade
+    /// darker, and the active tab is a step toward the foreground.
+    pub fn from_scheme_colors(
+        background: RgbaColor,
+        foreground: RgbaColor,
+        bell: RgbaColor,
+    ) -> Self {
+        let black: RgbaColor = (0, 0, 0).into();
+        let bar = mix(background, black, 0.15);
+        let muted = mix(foreground, background, 0.45);
+        let hover_bg = mix(background, foreground, 0.08);
+        let tab = |bg_color, fg_color| TabBarColor {
+            bg_color,
+            fg_color,
+            ..TabBarColor::default()
+        };
+        let hover = |bg_color, fg_color| TabBarColor {
+            italic: true,
+            ..tab(bg_color, fg_color)
+        };
+        Self {
+            background: Some(bar),
+            active_tab: Some(TabBarColor {
+                intensity: frankenterm_term::Intensity::Bold,
+                ..tab(mix(background, foreground, 0.18), foreground)
+            }),
+            inactive_tab: Some(tab(background, muted)),
+            inactive_tab_hover: Some(hover(hover_bg, foreground)),
+            new_tab: Some(tab(bar, muted)),
+            new_tab_hover: Some(hover(hover_bg, foreground)),
+            inactive_tab_edge: Some(mix(background, foreground, 0.2)),
+            inactive_tab_edge_hover: Some(mix(background, foreground, 0.12)),
+            inactive_tab_bell: Some(tab(mix(background, bell, 0.2), foreground)),
+            inactive_tab_bell_hover: Some(hover(mix(background, bell, 0.3), foreground)),
+        }
+    }
+
     pub fn overlay_with(&self, other: &Self) -> Self {
         macro_rules! overlay {
             ($name:ident) => {
@@ -502,6 +560,18 @@ impl TryFrom<String> for IntegratedTitleButtonColor {
             Ok(Self::Custom(RgbaColor::try_from(value)?))
         }
     }
+}
+
+/// Mixes `t` of `to` into `from`, channel by channel in sRGB. The result is opaque.
+fn mix(from: RgbaColor, to: RgbaColor, t: f32) -> RgbaColor {
+    let channel = |a: f32, b: f32| a + (b - a) * t;
+    SrgbaTuple(
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+        1.0,
+    )
+    .into()
 }
 
 fn default_background() -> RgbaColor {
@@ -1077,5 +1147,58 @@ brights = ["#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#0
         let scheme = ColorSchemeFile::from_toml_str(toml_str).unwrap();
         let value = scheme.to_toml_value().unwrap();
         assert!(value.is_table());
+    }
+
+    fn scheme_palette() -> Palette {
+        let mut ansi = [RgbaColor::default(); 8];
+        ansi[3] = (0xd7, 0x99, 0x21).into();
+        Palette {
+            background: Some((0x28, 0x28, 0x28).into()),
+            foreground: Some((0xeb, 0xdb, 0xb2).into()),
+            ansi: Some(ansi),
+            ..Palette::default()
+        }
+    }
+
+    #[test]
+    fn tab_bar_follows_a_scheme_without_tab_bar_colors() {
+        let palette = scheme_palette().with_tab_bar_from_scheme();
+        let tab_bar = palette.tab_bar.expect("tab bar colors are filled in");
+        let background: RgbaColor = (0x28, 0x28, 0x28).into();
+        let foreground: RgbaColor = (0xeb, 0xdb, 0xb2).into();
+
+        assert_eq!(tab_bar.inactive_tab().bg_color, background);
+        assert_eq!(tab_bar.active_tab().fg_color, foreground);
+        assert_eq!(tab_bar.active_tab().intensity, frankenterm_term::Intensity::Bold);
+        // The bar behind the tabs is darker than the terminal, the active tab lighter.
+        let luminance = |c: RgbaColor| SrgbaTuple::from(c).to_linear().relative_luminance();
+        assert!(luminance(tab_bar.background()) < luminance(background));
+        assert!(luminance(tab_bar.active_tab().bg_color) > luminance(background));
+        // The bell tab leans toward the scheme's yellow.
+        let bell = tab_bar.inactive_tab_bell().bg_color;
+        assert!(bell.0 > background.0 && bell.2 < bell.0);
+    }
+
+    #[test]
+    fn tab_bar_colors_the_scheme_sets_win_over_derived_ones() {
+        let set_bg: RgbaColor = (0x11, 0x22, 0x33).into();
+        let palette = Palette {
+            tab_bar: Some(TabBarColors {
+                background: Some(set_bg),
+                ..TabBarColors::default()
+            }),
+            ..scheme_palette()
+        }
+        .with_tab_bar_from_scheme();
+        let tab_bar = palette.tab_bar.unwrap();
+
+        assert_eq!(tab_bar.background(), set_bg);
+        assert_eq!(tab_bar.inactive_tab().bg_color, (0x28, 0x28, 0x28).into());
+    }
+
+    #[test]
+    fn tab_bar_keeps_built_in_colors_without_a_scheme() {
+        let palette = Palette::default().with_tab_bar_from_scheme();
+        assert_eq!(palette.tab_bar, None);
     }
 }
