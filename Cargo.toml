@@ -657,6 +657,14 @@ inherits = "release"
 opt-level = 3
 panic = "unwind"
 
+[profile.release-local]
+# The oysteinkrog localbuilds package. Same code generation as
+# release-interactive, but with line tables and no stripping, so perf on the
+# installed GUI can name functions and source lines.
+inherits = "release-interactive"
+debug = "line-tables-only"
+strip = "none"
+
 [profile.release-abort-probe]
 # Negative-control artifact used only by the panic-contract subprocess gate.
 # Keeping abort behind an explicit name means an operator's conventional
