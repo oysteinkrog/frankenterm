@@ -5649,7 +5649,6 @@ fn run() -> anyhow::Result<()> {
     frankenterm_bootstrap();
     register_gui_lua_modules();
 
-    stats::Stats::init()?;
     let _saver = umask::UmaskSaver::new();
 
     config::common_init(
@@ -5658,6 +5657,9 @@ fn run() -> anyhow::Result<()> {
         opts.skip_config,
     )?;
     let config = config::configuration();
+    if stats::Stats::wanted(&config) {
+        stats::Stats::init()?;
+    }
     if let Some(value) = &config.default_ssh_auth_sock {
         #[allow(unused_unsafe)]
         unsafe {

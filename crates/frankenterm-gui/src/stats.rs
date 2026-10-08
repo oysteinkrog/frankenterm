@@ -289,6 +289,17 @@ impl Stats {
         }
     }
 
+    /// Whether to install the recorder at startup. Recording costs the main
+    /// thread a clock read and a handle lookup on every frame, line and glyph,
+    /// and nothing reads the numbers unless `periodic_stat_logging` is set or
+    /// `FRANKENTERM_GUI_STATS=1` asks for them (for the Lua `get_counters`).
+    /// Without a recorder the `metrics` macros return at once. Setting
+    /// `periodic_stat_logging` later, by a config reload, needs a restart.
+    pub fn wanted(config: &config::ConfigHandle) -> bool {
+        config.periodic_stat_logging > 0
+            || std::env::var_os("FRANKENTERM_GUI_STATS").is_some_and(|v| v == "1")
+    }
+
     pub fn init() -> anyhow::Result<()> {
         let stats = Self::new();
         let inner = Arc::clone(&stats.inner);
