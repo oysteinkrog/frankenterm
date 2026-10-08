@@ -848,6 +848,7 @@ impl TabBarState {
         };
 
         if config.show_tabs_in_tab_bar {
+            let mut formatter = TabTitleFormatter::new(tab_info, pane_info, config);
             for (tab_idx, tab) in tab_info.iter().enumerate() {
                 if y >= rows {
                     break;
@@ -855,7 +856,7 @@ impl TabBarState {
                 let active = tab.is_active;
                 let hover = !active && is_hover(y);
                 let tab_title =
-                    compute_tab_title(tab, tab_info, pane_info, config, hover, title_max_width);
+                    compute_tab_title(&mut formatter, tab, config, hover, title_max_width);
                 let cell_attrs = tab_cell_attrs(
                     active,
                     hover,
@@ -970,6 +971,7 @@ mod tests {
                 active_pane: None,
                 window_id: 0,
                 tab_title: String::new(),
+                has_bell: false,
             })
             .collect()
     }
