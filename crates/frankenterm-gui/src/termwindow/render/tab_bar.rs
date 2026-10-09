@@ -1,5 +1,5 @@
 use crate::quad::TripleLayerQuadAllocator;
-use crate::termwindow::render::RenderScreenLineParams;
+use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use config::{ConfigHandle, TabBarPosition};
@@ -238,7 +238,11 @@ impl crate::TermWindow {
                 font: None,
                 use_pixel_positioning: self.config.experimental_pixel_positioning,
                 render_metrics: self.render_metrics,
-                shape_key: None,
+                shape_key: Some(LineToEleShapeCacheKey {
+                    shape_hash: tab_bar_shape_hash(line),
+                    composing: None,
+                    shape_generation: self.shape_generation,
+                }),
                 password_input: false,
             },
             layers,
@@ -373,5 +377,43 @@ mod tests {
                 TabBarInsets::default()
             );
         }
+    }
+}
+
+/// The line shape cache key for a tab bar row. Without one, every frame
+/// shaped every row of the tab bar again, and with a vertical tab bar of a
+/// few dozen tabs that cost more than drawing the panes. Tab bar rows are
+/// colored with the window palette while pane rows can use their own, so the
+/// row hash is salted to keep tab bar entries apart from pane entries with the
+/// same text and attributes.
+fn tab_bar_shape_hash(line: &Line) -> [u8; 16] {
+    const TAB_BAR_SALT: [u8; 16] = *b"frankenterm-tabs";
+    let mut hash = line.compute_shape_hash();
+    for (byte, salt) in hash.iter_mut().zip(TAB_BAR_SALT) {
+        *byte ^= salt;
+    }
+    hash
+}
+
+
+#[cfg(test)]
+mod tab_bar_shape_tests {
+    use super::*;
+    use termwiz::cell::CellAttributes;
+
+    fn row(text: &str) -> Line {
+        Line::from_text(text, &CellAttributes::default(), 0, None)
+    }
+
+    #[test]
+    fn tab_bar_rows_get_stable_keys_apart_from_pane_rows() {
+        let title = row(" 1 ● build ");
+        assert_eq!(tab_bar_shape_hash(&title), tab_bar_shape_hash(&row(" 1 ● build ")));
+        assert_ne!(tab_bar_shape_hash(&title), tab_bar_shape_hash(&row(" 2 ● build ")));
+        assert_ne!(
+            tab_bar_shape_hash(&title),
+            title.compute_shape_hash(),
+            "a pane row with the same text must not share the tab bar entry"
+        );
     }
 }

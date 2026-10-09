@@ -135,6 +135,9 @@ pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
+/// Shortest gap between two coalesced tab and window title refreshes.
+const TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
 const ATLAS_SIZE: usize = 128;
 
 lazy_static::lazy_static! {
@@ -5473,14 +5476,14 @@ impl TermWindow {
                     actions.request_repaint();
                 }
                 if let Some(title_refresh) = title_refresh {
-                    // Release the single-flight bit before reading live state;
-                    // output during this refresh can retain a successor ticket.
+                    // Release the single-flight bit; a later title change can
+                    // queue a successor ticket.
                     title_refresh.begin_refresh();
-                    self.update_title_impl(Some(&actions));
-                    // A title/progress-only refresh can change the tab bar
-                    // without any pane output. Retain its native repaint under
-                    // this admission before the visibility check returns.
-                    actions.request_repaint();
+                    // Recomputing titles runs format-tab-title for every tab,
+                    // and busy panes change their titles many times a second.
+                    // Coalesce like the alert path. update_title_impl repaints
+                    // only when the tab bar actually changed.
+                    self.schedule_update_title();
                 }
                 if interest.iter().any(|word| *word != 0) {
                     self.record_idle_event(idle_detector::IdleEvent::PtyData);
@@ -7783,7 +7786,8 @@ impl TermWindow {
         }
     }
 
-    /// Schedule a coalesced `update_title()` at most once per ~16 ms frame.
+    /// Schedule a coalesced `update_title()` at most once per
+    /// `TITLE_REFRESH_INTERVAL`.
     ///
     /// Multiple mux subscribers (one per attached domain) re-emit Alerts like
     /// `Progress`, `CurrentWorkingDirectoryChanged`, and `OutputSinceFocusLost`
@@ -7791,8 +7795,12 @@ impl TermWindow {
     /// directly per Alert produces O(N_tabs × N_panes × Lua_roundtrip)
     /// allocation churn per call, dozens of times per second — the dominant
     /// driver of the wezterm-gui RSS leak observed in production. Coalescing
-    /// to one frame caps the call rate at ~60/sec independent of fanout.
-    /// See ft-9d60d.
+    /// caps the call rate independent of fanout. See ft-9d60d.
+    ///
+    /// The interval was one 16 ms frame. With dozens of tabs and several busy
+    /// panes animating their titles, 60 refreshes a second of format-tab-title
+    /// for every tab (and the repaint each one requested) kept the main thread
+    /// busy, so titles now settle at 10 refreshes a second.
     fn schedule_update_title(&mut self) {
         if self.pending_update_title {
             metrics::histogram!("update_title.coalesced").record(1.);
@@ -7810,8 +7818,7 @@ impl TermWindow {
                 promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                     reservation
                         .spawn_local(async move {
-                            // ~one frame at 60 Hz. Imperceptible delay for OSC-driven UI.
-                            sleep(Duration::from_millis(16)).await;
+                            sleep(TITLE_REFRESH_INTERVAL).await;
                             window.notify(TermWindowNotif::Apply(Box::new(|tw| {
                                 tw.pending_update_title = false;
                                 tw.update_title();
