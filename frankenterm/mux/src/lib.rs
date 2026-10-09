@@ -4623,6 +4623,10 @@ mod pane_registration_handle {
             self.pane.palette()
         }
 
+        pub fn copy_user_vars(&self) -> std::collections::HashMap<String, String> {
+            self.pane.copy_user_vars()
+        }
+
         pub fn semantic_snapshot(
             &self,
         ) -> anyhow::Result<(
