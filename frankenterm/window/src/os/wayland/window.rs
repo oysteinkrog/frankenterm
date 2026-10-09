@@ -2694,7 +2694,8 @@ mod tests {
         fractional_pixels_to_surface, fractional_surface_to_pixels, preferred_scale_from_wire,
         key_repeat_first_due, key_repeat_timer_plan, key_repeat_timing, key_repeat_window_event,
         new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
-        validate_resize_increments, CompositorRepeatTransition, KeyRepeatAbort, KeyRepeatTimerPlan,
+        validate_resize_increments, frame_wait_plan, CompositorRepeatTransition, FrameWaitPlan,
+        KeyRepeatAbort, KeyRepeatTimerPlan,
     };
     use crate::{
         Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, ResizeIncrement, WindowEvent,
