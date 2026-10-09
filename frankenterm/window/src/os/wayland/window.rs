@@ -1760,10 +1760,12 @@ impl WaylandWindowInner {
     }
 
     fn invalidate(&mut self) {
-        if self.frame_callback.is_some() {
-            self.invalidated = true;
-            return;
-        }
+        // Let do_paint decide: it paints when no frame callback is pending,
+        // defers and arms the FRAME_CALLBACK_TIMEOUT wake-up when one is
+        // fresh, and drops one that is overdue. Returning early here when a
+        // callback was pending never armed that wake-up, so the renderer's
+        // own retry (a 16 ms wake after a NativeFramePending paint) left a
+        // covered window waiting for a callback KWin never sends.
         self.request_paint("invalidate");
     }
 
