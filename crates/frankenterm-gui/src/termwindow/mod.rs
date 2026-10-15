@@ -2395,6 +2395,7 @@ pub struct TermWindow {
     next_line_state_id: u64,
 
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
+    tab_bar_quad_cache: RefCell<render::tab_bar::TabBarQuadCache>,
 
     /// Last mux window-order revision reconciled against `tab_state`. This
     /// keeps closed-tab state bounded without rescanning all tabs on ordinary
@@ -4668,6 +4669,7 @@ impl TermWindow {
                 |config| config.line_quad_cache_size,
                 &config,
             )),
+            tab_bar_quad_cache: RefCell::default(),
             last_tab_state_prune_revision: Cell::new(None),
             line_to_ele_shape_cache: RefCell::new(LfuCache::new(
                 "line_to_ele_shape_cache.hit.rate",

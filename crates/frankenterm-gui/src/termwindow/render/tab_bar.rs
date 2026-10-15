@@ -1,4 +1,4 @@
-use crate::quad::TripleLayerQuadAllocator;
+use crate::quad::{HeapQuadAllocator, TripleLayerQuadAllocator};
 use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
@@ -51,6 +51,49 @@ impl TabBarInsets {
     }
 }
 
+/// Quads drawn for each tab bar row, so an unchanged row is copied instead of
+/// being shaped and laid out again on every frame. The vertical tab bar has a
+/// row per window line, and without this cache it cost more per frame than
+/// the pane itself.
+#[derive(Default)]
+pub struct TabBarQuadCache {
+    /// Rows hold resolved colors, so a different palette drops every row.
+    palette: Option<ColorPalette>,
+    rows: Vec<Option<TabBarRowQuads>>,
+}
+
+impl TabBarQuadCache {
+    fn start_frame(&mut self, palette: &ColorPalette, rows: usize) {
+        if self.palette.as_ref() != Some(palette) {
+            self.palette = Some(palette.clone());
+            self.rows.clear();
+        }
+        self.rows.resize_with(rows, || None);
+    }
+}
+
+struct TabBarRowQuads {
+    key: TabBarRowQuadKey,
+    layers: HeapQuadAllocator,
+}
+
+/// Everything the quads of one tab bar row depend on, apart from the palette.
+#[derive(PartialEq)]
+struct TabBarRowQuadKey {
+    line_hash: [u8; 16],
+    top_pixel_y: f32,
+    left_pixel_x: f32,
+    pixel_width: f32,
+    cols: usize,
+    cell_width: isize,
+    cell_height: isize,
+    config_generation: usize,
+    shape_generation: usize,
+    quad_generation: usize,
+    window_is_transparent: bool,
+    default_bg: LinearRgba,
+}
+
 impl crate::TermWindow {
     pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         if self.config.is_vertical_tab_bar() {
@@ -91,9 +134,11 @@ impl crate::TermWindow {
 
         let cols =
             self.dimensions.pixel_width / (self.render_metrics.cell_size.width as usize).max(1);
+        self.tab_bar_quad_cache.borrow_mut().start_frame(&palette, 1);
         self.render_tab_bar_line(
             layers,
             &palette,
+            0,
             self.tab_bar.line(),
             0.,
             tab_bar_y,
@@ -123,10 +168,14 @@ impl crate::TermWindow {
 
         let cols = self.config.vertical_tab_width.max(1);
         let lines = self.tab_bar.vertical_lines();
+        self.tab_bar_quad_cache
+            .borrow_mut()
+            .start_frame(&palette, lines.len());
         for (row, line) in lines.iter().enumerate() {
             self.render_tab_bar_line(
                 layers,
                 &palette,
+                row,
                 line,
                 left_pixel_x,
                 top_pixel_y + (row as f32 * cell_height),
@@ -176,6 +225,7 @@ impl crate::TermWindow {
         &self,
         layers: &mut TripleLayerQuadAllocator,
         palette: &ColorPalette,
+        row: usize,
         line: &Line,
         left_pixel_x: f32,
         top_pixel_y: f32,
@@ -199,6 +249,31 @@ impl crate::TermWindow {
                 self.config.text_background_opacity
             });
 
+        let line_hash = tab_bar_shape_hash(line);
+        let key = TabBarRowQuadKey {
+            line_hash,
+            top_pixel_y,
+            left_pixel_x,
+            pixel_width,
+            cols,
+            cell_width: self.render_metrics.cell_size.width,
+            cell_height: self.render_metrics.cell_size.height,
+            config_generation: self.config.generation(),
+            shape_generation: self.shape_generation,
+            quad_generation: self.quad_generation,
+            window_is_transparent,
+            default_bg,
+        };
+        if let Some(Some(cached)) = self.tab_bar_quad_cache.borrow().rows.get(row) {
+            if cached.key == key {
+                return cached
+                    .layers
+                    .apply_to(layers)
+                    .context("apply cached tab bar row quads");
+            }
+        }
+
+        let mut buf = HeapQuadAllocator::default();
         self.render_screen_line(
             RenderScreenLineParams {
                 top_pixel_y,
@@ -239,15 +314,20 @@ impl crate::TermWindow {
                 use_pixel_positioning: self.config.experimental_pixel_positioning,
                 render_metrics: self.render_metrics,
                 shape_key: Some(LineToEleShapeCacheKey {
-                    shape_hash: tab_bar_shape_hash(line),
+                    shape_hash: line_hash,
                     composing: None,
                     shape_generation: self.shape_generation,
                 }),
                 password_input: false,
             },
-            layers,
+            &mut TripleLayerQuadAllocator::Heap(&mut buf),
         )?;
+        buf.apply_to(layers)
+            .context("apply tab bar row quads")?;
 
+        if let Some(slot) = self.tab_bar_quad_cache.borrow_mut().rows.get_mut(row) {
+            *slot = Some(TabBarRowQuads { key, layers: buf });
+        }
         Ok(())
     }
 
@@ -414,6 +494,50 @@ mod tab_bar_shape_tests {
             tab_bar_shape_hash(&title),
             title.compute_shape_hash(),
             "a pane row with the same text must not share the tab bar entry"
+        );
+    }
+
+    fn cached_row(cache: &mut TabBarQuadCache, row: usize) {
+        cache.rows[row] = Some(TabBarRowQuads {
+            key: TabBarRowQuadKey {
+                line_hash: [0; 16],
+                top_pixel_y: 0.,
+                left_pixel_x: 0.,
+                pixel_width: 0.,
+                cols: 0,
+                cell_width: 0,
+                cell_height: 0,
+                config_generation: 0,
+                shape_generation: 0,
+                quad_generation: 0,
+                window_is_transparent: false,
+                default_bg: LinearRgba::default(),
+            },
+            layers: HeapQuadAllocator::default(),
+        });
+    }
+
+    #[test]
+    fn tab_bar_quad_cache_keeps_rows_until_the_palette_changes() {
+        let palette = ColorPalette::default();
+        let mut cache = TabBarQuadCache::default();
+        cache.start_frame(&palette, 3);
+        cached_row(&mut cache, 0);
+        cached_row(&mut cache, 2);
+
+        cache.start_frame(&palette, 3);
+        assert!(cache.rows[0].is_some() && cache.rows[2].is_some());
+
+        cache.start_frame(&palette, 2);
+        assert_eq!(cache.rows.len(), 2, "rows past the bar's height are dropped");
+        assert!(cache.rows[0].is_some());
+
+        let mut other = palette.clone();
+        other.foreground = wezterm_term::color::SrgbaTuple(1., 0., 0., 1.);
+        cache.start_frame(&other, 2);
+        assert!(
+            cache.rows.iter().all(Option::is_none),
+            "rows hold resolved colors, so a new palette must drop them"
         );
     }
 }
