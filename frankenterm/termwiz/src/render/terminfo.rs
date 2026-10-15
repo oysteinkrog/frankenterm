@@ -269,6 +269,14 @@ impl TerminfoRenderer {
         }
     }
 
+    /// Forget the attribute and cursor state, as if newly created, so one
+    /// renderer and its capabilities can be reused for unrelated output.
+    pub fn reset(&mut self) {
+        self.current_attr = CellAttributes::default();
+        self.pending_attr = None;
+        self.cursor_position = Some((0, 0));
+    }
+
     fn get_capability<'a, T: TermInfoCapability<'a>>(&'a self) -> Option<T> {
         self.caps.terminfo_db().and_then(|db| db.get::<T>())
     }

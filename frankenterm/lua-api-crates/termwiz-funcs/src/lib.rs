@@ -144,10 +144,27 @@ impl termwiz::render::RenderTty for FormatTarget {
 pub fn format_as_escapes(items: Vec<FormatItem>) -> anyhow::Result<String> {
     let mut changes: Vec<Change> = items.into_iter().map(Into::into).collect();
     changes.push(Change::AllAttributes(CellAttributes::default()));
-    let mut renderer = new_frankenterm_terminfo_renderer();
     let mut target = FormatTarget { target: vec![] };
-    renderer.render_to(&changes, &mut target)?;
+    with_reset_renderer(|renderer| renderer.render_to(&changes, &mut target))?;
     Ok(String::from_utf8(target.target)?)
+}
+
+thread_local! {
+    /// A renderer kept per thread. Building one clones the whole terminfo
+    /// database, which cost more than the formatting itself when tab titles
+    /// were formatted on every tab bar refresh.
+    static RENDERER: std::cell::RefCell<Option<TerminfoRenderer>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's renderer, reset to the state of a new one.
+fn with_reset_renderer<R>(f: impl FnOnce(&mut TerminfoRenderer) -> R) -> R {
+    RENDERER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let renderer = slot.get_or_insert_with(new_frankenterm_terminfo_renderer);
+        renderer.reset();
+        f(renderer)
+    })
 }
 
 #[cfg(feature = "lua")]
@@ -277,7 +294,6 @@ pub fn lines_to_escapes(lines: Vec<Line>) -> anyhow::Result<String> {
         }
     }
     changes.push(Change::AllAttributes(CellAttributes::blank()));
-    let mut renderer = new_frankenterm_terminfo_renderer();
 
     struct Target {
         target: Vec<u8>,
@@ -299,6 +315,39 @@ pub fn lines_to_escapes(lines: Vec<Line>) -> anyhow::Result<String> {
     }
 
     let mut target = Target { target: vec![] };
-    renderer.render_to(&changes, &mut target)?;
+    with_reset_renderer(|renderer| renderer.render_to(&changes, &mut target))?;
     Ok(String::from_utf8(target.target)?)
+}
+
+#[cfg(test)]
+mod renderer_reuse_tests {
+    use super::*;
+    use termwiz::cell::Intensity;
+
+    fn fresh_render(items: Vec<FormatItem>) -> String {
+        let mut changes: Vec<Change> = items.into_iter().map(Into::into).collect();
+        changes.push(Change::AllAttributes(CellAttributes::default()));
+        let mut renderer = new_frankenterm_terminfo_renderer();
+        let mut target = FormatTarget { target: vec![] };
+        renderer.render_to(&changes, &mut target).unwrap();
+        String::from_utf8(target.target).unwrap()
+    }
+
+    fn red_title() -> Vec<FormatItem> {
+        vec![
+            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red)),
+            FormatItem::Attribute(AttributeChange::Intensity(Intensity::Bold)),
+            FormatItem::Text("build".to_string()),
+        ]
+    }
+
+    #[test]
+    fn reused_renderer_formats_like_a_new_one() {
+        let plain = vec![FormatItem::Text("idle".to_string())];
+        assert_eq!(format_as_escapes(red_title()).unwrap(), fresh_render(red_title()));
+        // The previous call left the renderer after bold red text. A reset
+        // renderer must not carry that state into the next title.
+        assert_eq!(format_as_escapes(plain.clone()).unwrap(), fresh_render(plain));
+        assert_eq!(format_as_escapes(red_title()).unwrap(), fresh_render(red_title()));
+    }
 }
