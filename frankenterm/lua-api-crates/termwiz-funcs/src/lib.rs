@@ -344,10 +344,19 @@ mod renderer_reuse_tests {
     #[test]
     fn reused_renderer_formats_like_a_new_one() {
         let plain = vec![FormatItem::Text("idle".to_string())];
-        assert_eq!(format_as_escapes(red_title()).unwrap(), fresh_render(red_title()));
+        assert_eq!(
+            format_as_escapes(red_title()).unwrap(),
+            fresh_render(red_title())
+        );
         // The previous call left the renderer after bold red text. A reset
         // renderer must not carry that state into the next title.
-        assert_eq!(format_as_escapes(plain.clone()).unwrap(), fresh_render(plain));
-        assert_eq!(format_as_escapes(red_title()).unwrap(), fresh_render(red_title()));
+        assert_eq!(
+            format_as_escapes(plain.clone()).unwrap(),
+            fresh_render(plain)
+        );
+        assert_eq!(
+            format_as_escapes(red_title()).unwrap(),
+            fresh_render(red_title())
+        );
     }
 }

@@ -134,7 +134,9 @@ impl crate::TermWindow {
 
         let cols =
             self.dimensions.pixel_width / (self.render_metrics.cell_size.width as usize).max(1);
-        self.tab_bar_quad_cache.borrow_mut().start_frame(&palette, 1);
+        self.tab_bar_quad_cache
+            .borrow_mut()
+            .start_frame(&palette, 1);
         self.render_tab_bar_line(
             layers,
             &palette,
@@ -322,8 +324,7 @@ impl crate::TermWindow {
             },
             &mut TripleLayerQuadAllocator::Heap(&mut buf),
         )?;
-        buf.apply_to(layers)
-            .context("apply tab bar row quads")?;
+        buf.apply_to(layers).context("apply tab bar row quads")?;
 
         if let Some(slot) = self.tab_bar_quad_cache.borrow_mut().rows.get_mut(row) {
             *slot = Some(TabBarRowQuads { key, layers: buf });
@@ -475,7 +476,6 @@ fn tab_bar_shape_hash(line: &Line) -> [u8; 16] {
     hash
 }
 
-
 #[cfg(test)]
 mod tab_bar_shape_tests {
     use super::*;
@@ -488,8 +488,14 @@ mod tab_bar_shape_tests {
     #[test]
     fn tab_bar_rows_get_stable_keys_apart_from_pane_rows() {
         let title = row(" 1 ● build ");
-        assert_eq!(tab_bar_shape_hash(&title), tab_bar_shape_hash(&row(" 1 ● build ")));
-        assert_ne!(tab_bar_shape_hash(&title), tab_bar_shape_hash(&row(" 2 ● build ")));
+        assert_eq!(
+            tab_bar_shape_hash(&title),
+            tab_bar_shape_hash(&row(" 1 ● build "))
+        );
+        assert_ne!(
+            tab_bar_shape_hash(&title),
+            tab_bar_shape_hash(&row(" 2 ● build "))
+        );
         assert_ne!(
             tab_bar_shape_hash(&title),
             title.compute_shape_hash(),
@@ -529,7 +535,11 @@ mod tab_bar_shape_tests {
         assert!(cache.rows[0].is_some() && cache.rows[2].is_some());
 
         cache.start_frame(&palette, 2);
-        assert_eq!(cache.rows.len(), 2, "rows past the bar's height are dropped");
+        assert_eq!(
+            cache.rows.len(),
+            2,
+            "rows past the bar's height are dropped"
+        );
         assert!(cache.rows[0].is_some());
 
         let mut other = palette.clone();
