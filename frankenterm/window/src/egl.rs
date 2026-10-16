@@ -106,7 +106,9 @@ fn set_non_blocking_swap_interval(
     unsafe {
         if connection.MakeCurrent(connection.display, surface, surface, context) == 0 {
             let err = connection.egl.error("MakeCurrent");
-            log::error!("cannot make the new EGL surface current to set its swap interval: {err:#}");
+            log::error!(
+                "cannot make the new EGL surface current to set its swap interval: {err:#}"
+            );
             return;
         }
         if connection.egl.egl.SwapInterval(connection.display, 0) == 0 {
