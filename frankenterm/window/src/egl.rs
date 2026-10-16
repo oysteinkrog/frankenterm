@@ -92,6 +92,30 @@ pub struct GlState {
     context: ffi::types::EGLContext,
 }
 
+/// eglSwapInterval applies to the surface bound to the calling thread's
+/// current context, so the new surface must be current first. Called with no
+/// current context it fails with EGL_BAD_CONTEXT and the surface keeps the
+/// default interval of 1. On Wayland that makes eglSwapBuffers wait for the
+/// compositor's frame callback, which KWin withholds while the screen is
+/// locked or off, so the GUI main thread blocked until the next logon.
+fn set_non_blocking_swap_interval(
+    connection: &GlConnection,
+    surface: ffi::types::EGLSurface,
+    context: ffi::types::EGLContext,
+) {
+    unsafe {
+        if connection.MakeCurrent(connection.display, surface, surface, context) == 0 {
+            let err = connection.egl.error("MakeCurrent");
+            log::error!("cannot make the new EGL surface current to set its swap interval: {err:#}");
+            return;
+        }
+        if connection.egl.egl.SwapInterval(connection.display, 0) == 0 {
+            let err = connection.egl.error("SwapInterval");
+            log::warn!("eglSwapInterval(0) failed; buffer swaps may block: {err:#}");
+        }
+    }
+}
+
 fn query_dimensions(width: ffi::EGLint, height: ffi::EGLint) -> (u32, u32) {
     (width.max(0) as u32, height.max(0) as u32)
 }
@@ -650,9 +674,7 @@ impl GlState {
 
             // Request non-blocking buffer swaps; we'll manage throttling
             // frames at the application level.
-            unsafe {
-                connection.egl.egl.SwapInterval(connection.display, 0);
-            }
+            set_non_blocking_swap_interval(connection, surface, context);
 
             return Ok(Self {
                 connection: Rc::clone(connection),
