@@ -78,6 +78,7 @@ pub(crate) const TEST_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
         MuxSessionIncarnation::from_bytes([0x57; 16]),
     );
 
+#[track_caller]
 fn reserve_client_main_thread(
     service_class: MainThreadServiceClass,
     estimated_bytes: usize,
@@ -88,6 +89,74 @@ fn reserve_client_main_thread(
         rejected => Err(anyhow!(
             "main-thread scheduler rejected {operation} before task construction: {rejected:?}"
         )),
+    }
+}
+
+/// How long the reader waits for a full main-thread queue to drain before it
+/// gives up on a unilateral PDU and retires the connection.
+const UNILATERAL_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+/// Like [`reserve_client_main_thread`], but waits while the queue is full.
+///
+/// A full queue means the main thread is behind, not that the connection is
+/// broken. Failing at once retired the whole mux connection, and with it every
+/// pane, so a GUI whose main thread stalled for a few seconds closed its
+/// windows and exited. Waiting here pushes back on the server instead. The
+/// wait is bounded because main-thread tasks that await an RPC reply hold
+/// queue slots while this reader is not reading replies.
+async fn reserve_client_main_thread_waiting(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+) -> anyhow::Result<MainThreadSpawnReservation> {
+    reserve_main_thread_waiting(
+        || try_reserve_main_thread(service_class, estimated_bytes),
+        UNILATERAL_ADMISSION_WAIT,
+        operation,
+    )
+    .await
+}
+
+async fn reserve_main_thread_waiting(
+    mut try_reserve: impl FnMut() -> MainThreadReservationOutcome,
+    max_wait: Duration,
+    operation: &'static str,
+) -> anyhow::Result<MainThreadSpawnReservation> {
+    let started = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    let mut logged = false;
+    loop {
+        match try_reserve() {
+            MainThreadReservationOutcome::Reserved(reservation) => {
+                if logged {
+                    log::warn!(
+                        "main-thread queue accepted {operation} after waiting {:?}",
+                        started.elapsed()
+                    );
+                }
+                return Ok(reservation);
+            }
+            MainThreadReservationOutcome::RetryableFull(rejection)
+                if started.elapsed() < max_wait =>
+            {
+                if !logged {
+                    logged = true;
+                    log::warn!(
+                        "main-thread queue is full; reader waits up to {max_wait:?} \
+                         before retrying {operation}: {rejection:?}"
+                    );
+                }
+                promise::spawn::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            rejected => {
+                return Err(anyhow!(
+                    "main-thread scheduler rejected {operation} before task construction \
+                     after {:?}: {rejected:?}",
+                    started.elapsed()
+                ))
+            }
+        }
     }
 }
 
@@ -4903,6 +4972,37 @@ fn process_unilateral(
     Ok(())
 }
 
+/// The reader's form of [`process_unilateral`]: waits for main-thread capacity
+/// instead of failing, see [`reserve_client_main_thread_waiting`].
+async fn process_unilateral_waiting(
+    authority: &ClientDispatchAuthority,
+    decoded: DecodedPdu,
+) -> anyhow::Result<()> {
+    if !authority.rpc_generation_is_live() {
+        return Ok(());
+    }
+    if authority.is_standalone() {
+        return handle_unilateral_without_local_domain(authority, &decoded);
+    }
+    let reservation = reserve_client_main_thread_waiting(
+        MainThreadServiceClass::Topology,
+        CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
+        "unilateral client update",
+    )
+    .await?;
+    // Resolve after the wait: the dispatch may have been retired meanwhile.
+    if !authority.rpc_generation_is_live() {
+        return Ok(());
+    }
+    let Some(dispatch) = authority.resolve_current()? else {
+        return Ok(());
+    };
+    reservation
+        .spawn(async move { apply_unilateral_on_main_thread(dispatch, decoded).await })
+        .detach();
+    Ok(())
+}
+
 async fn process_unilateral_with_barrier(
     authority: &ClientDispatchAuthority,
     decoded: DecodedPdu,
@@ -7500,7 +7600,7 @@ fn fallback_rewake(current: &Cx, task_cx: &TaskContext<'_>, fallback: &SshPollFa
     }
 }
 
-fn route_client_unilateral_batch(
+async fn route_client_unilateral_batch(
     dispatch_authority: &ClientDispatchAuthority,
     generation: NonZeroU64,
     readiness: &RpcReadinessCoordinator,
@@ -7514,7 +7614,8 @@ fn route_client_unilateral_batch(
             .load(AtomicOrdering::Acquire)
             == generation.get();
         if generation_is_ready {
-            process_unilateral(dispatch_authority, decoded)
+            process_unilateral_waiting(dispatch_authority, decoded)
+                .await
                 .context("processing unilateral PDU from server")?;
         } else {
             let (replayed_pdus, replayed_bytes) = readiness.replayed_in_flight();
@@ -7704,7 +7805,7 @@ async fn client_thread_async(
                         &readiness,
                         &mut pre_ready_unilateral,
                         routed,
-                    ) {
+                    ).await {
                         let message = format!(
                             "topology snapshot commit replay failed on generation {}: {error:#}",
                             generation
@@ -7791,7 +7892,7 @@ async fn client_thread_async(
                         &readiness,
                         &mut pre_ready_unilateral,
                         routed,
-                    ) {
+                    ).await {
                         let message = format!(
                             "legacy topology replay failed on generation {}: {error:#}",
                             generation
@@ -8225,7 +8326,7 @@ async fn client_thread_async(
                                             &readiness,
                                             &mut pre_ready_unilateral,
                                             routed,
-                                        )?;
+                                        ).await?;
                                     }
                                 }
                                 continue;
@@ -8296,7 +8397,7 @@ async fn client_thread_async(
                                             &readiness,
                                             &mut pre_ready_unilateral,
                                             routed,
-                                        )?;
+                                        ).await?;
                                     }
                                     pending.complete(
                                         serial,
@@ -8338,7 +8439,7 @@ async fn client_thread_async(
                                             &readiness,
                                             &mut pre_ready_unilateral,
                                             routed,
-                                        )?;
+                                        ).await?;
                                     }
                                 }
                             } else {
@@ -8375,7 +8476,7 @@ async fn client_thread_async(
                                             &readiness,
                                             &mut pre_ready_unilateral,
                                             routed,
-                                        )?;
+                                        ).await?;
                                         (false, None)
                                     }
                                     Some(ClientTopologyResponseAction::AwaitCommit) => (true, None),
@@ -11324,6 +11425,49 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
     use wezterm_term::TerminalSize;
+
+    /// Regression: a full main-thread queue used to fail the unilateral
+    /// admission at once, which retired the mux connection and closed the
+    /// GUI after the screen was locked. The reader must wait for capacity.
+    #[test]
+    fn unilateral_admission_waits_for_main_thread_capacity() {
+        use promise::spawn::{MainThreadAdmissionLimits, SimpleExecutor};
+        let _scope = MuxTestScope::enter();
+        let _executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 64 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let reserve = || try_reserve_main_thread(MainThreadServiceClass::Topology, 4 * 1024);
+        let MainThreadReservationOutcome::Reserved(held) = reserve() else {
+            panic!("the first reservation must fit the empty queue");
+        };
+
+        let error = promise::spawn::block_on(reserve_main_thread_waiting(
+            reserve,
+            Duration::ZERO,
+            "full-queue test",
+        ))
+        .expect_err("a full queue with no wait budget must still fail");
+        assert!(format!("{error:#}").contains("RetryableFull"), "{error:#}");
+
+        // The main thread drains the queue after a few retries.
+        let mut held = Some(held);
+        let mut attempts = 0;
+        let reservation = promise::spawn::block_on(reserve_main_thread_waiting(
+            || {
+                attempts += 1;
+                if attempts == 3 {
+                    drop(held.take());
+                }
+                reserve()
+            },
+            Duration::from_secs(30),
+            "full-queue test",
+        ))
+        .expect("the reader must wait for the queue to drain");
+        assert_eq!(attempts, 3);
+        drop(reservation);
+    }
 
     static TEST_LOGGER: TestLogger = TestLogger {
         records: StdMutex::new(Vec::new()),
