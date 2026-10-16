@@ -11449,7 +11449,7 @@ mod tests {
         ))
         .expect_err("a full queue with no wait budget must still fail");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("RetryableFull"), "{rendered}");
+        assert!(rendered.contains("RetryableFull"), "{}", rendered);
 
         // The main thread drains the queue after a few retries.
         let mut held = Some(held);
