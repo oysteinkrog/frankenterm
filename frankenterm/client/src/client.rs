@@ -109,50 +109,64 @@ async fn reserve_client_main_thread_waiting(
     estimated_bytes: usize,
     operation: &'static str,
 ) -> anyhow::Result<MainThreadSpawnReservation> {
-    reserve_main_thread_waiting(
-        || try_reserve_main_thread(service_class, estimated_bytes),
+    wait_for_main_thread_admission(
+        || match try_reserve_main_thread(service_class, estimated_bytes) {
+            MainThreadReservationOutcome::Reserved(reservation) => {
+                AdmissionAttempt::Admitted(reservation)
+            }
+            MainThreadReservationOutcome::RetryableFull(rejection) => {
+                AdmissionAttempt::RetryableFull(format!("{rejection:?}"))
+            }
+            rejected => AdmissionAttempt::Rejected(format!("{rejected:?}")),
+        },
         UNILATERAL_ADMISSION_WAIT,
         operation,
     )
     .await
 }
 
-async fn reserve_main_thread_waiting(
-    mut try_reserve: impl FnMut() -> MainThreadReservationOutcome,
+enum AdmissionAttempt<T> {
+    Admitted(T),
+    RetryableFull(String),
+    Rejected(String),
+}
+
+/// Retry `attempt` with backoff while it reports a full queue, for at most
+/// `max_wait`.
+async fn wait_for_main_thread_admission<T>(
+    mut attempt: impl FnMut() -> AdmissionAttempt<T>,
     max_wait: Duration,
     operation: &'static str,
-) -> anyhow::Result<MainThreadSpawnReservation> {
+) -> anyhow::Result<T> {
     let started = std::time::Instant::now();
     let mut backoff = Duration::from_millis(1);
     let mut logged = false;
     loop {
-        match try_reserve() {
-            MainThreadReservationOutcome::Reserved(reservation) => {
+        match attempt() {
+            AdmissionAttempt::Admitted(admitted) => {
                 if logged {
                     log::warn!(
                         "main-thread queue accepted {operation} after waiting {:?}",
                         started.elapsed()
                     );
                 }
-                return Ok(reservation);
+                return Ok(admitted);
             }
-            MainThreadReservationOutcome::RetryableFull(rejection)
-                if started.elapsed() < max_wait =>
-            {
+            AdmissionAttempt::RetryableFull(rejection) if started.elapsed() < max_wait => {
                 if !logged {
                     logged = true;
                     log::warn!(
                         "main-thread queue is full; reader waits up to {max_wait:?} \
-                         before retrying {operation}: {rejection:?}"
+                         before retrying {operation}: {rejection}"
                     );
                 }
                 promise::spawn::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(50));
             }
-            rejected => {
+            AdmissionAttempt::RetryableFull(rejected) | AdmissionAttempt::Rejected(rejected) => {
                 return Err(anyhow!(
                     "main-thread scheduler rejected {operation} before task construction \
-                     after {:?}: {rejected:?}",
+                     after {:?}: {rejected}",
                     started.elapsed()
                 ))
             }
@@ -11431,43 +11445,40 @@ mod tests {
     /// GUI after the screen was locked. The reader must wait for capacity.
     #[test]
     fn unilateral_admission_waits_for_main_thread_capacity() {
-        use promise::spawn::{MainThreadAdmissionLimits, SimpleExecutor};
-        let _scope = MuxTestScope::enter();
-        let _executor = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(1, 64 * 1024, 0, 0).unwrap(),
-        )
-        .unwrap();
-        let reserve = || try_reserve_main_thread(MainThreadServiceClass::Topology, 4 * 1024);
-        let MainThreadReservationOutcome::Reserved(held) = reserve() else {
-            panic!("the first reservation must fit the empty queue");
-        };
-
-        let error = promise::spawn::block_on(reserve_main_thread_waiting(
-            reserve,
+        let error = promise::spawn::block_on(wait_for_main_thread_admission(
+            || AdmissionAttempt::<()>::RetryableFull("queue full".to_string()),
             Duration::ZERO,
             "full-queue test",
         ))
         .expect_err("a full queue with no wait budget must still fail");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("RetryableFull"), "{}", rendered);
+        assert!(rendered.contains("queue full"), "{}", rendered);
 
         // The main thread drains the queue after a few retries.
-        let mut held = Some(held);
         let mut attempts = 0;
-        let reservation = promise::spawn::block_on(reserve_main_thread_waiting(
+        let admitted = promise::spawn::block_on(wait_for_main_thread_admission(
             || {
                 attempts += 1;
-                if attempts == 3 {
-                    drop(held.take());
+                if attempts < 3 {
+                    AdmissionAttempt::RetryableFull("queue full".to_string())
+                } else {
+                    AdmissionAttempt::Admitted(attempts)
                 }
-                reserve()
             },
             Duration::from_secs(30),
             "full-queue test",
         ))
         .expect("the reader must wait for the queue to drain");
-        assert_eq!(attempts, 3);
-        drop(reservation);
+        assert_eq!(admitted, 3);
+
+        let error = promise::spawn::block_on(wait_for_main_thread_admission(
+            || AdmissionAttempt::<()>::Rejected("retired".to_string()),
+            Duration::from_secs(30),
+            "retired-queue test",
+        ))
+        .expect_err("a retired scheduler must fail without waiting");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("retired"), "{}", rendered);
     }
 
     static TEST_LOGGER: TestLogger = TestLogger {
