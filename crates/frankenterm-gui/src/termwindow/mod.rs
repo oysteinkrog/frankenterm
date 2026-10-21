@@ -165,6 +165,9 @@ struct GuiPaneCleanupOwner {
     admission_pending: AtomicBool,
     retry_pending: AtomicBool,
     allocation_pending: AtomicBool,
+    /// Set when visible state was refused a credit. The next retained wake
+    /// repaints so the refused state is admitted once a credit returns.
+    repaint_owed: AtomicBool,
     retired: AtomicBool,
     subscribed: AtomicBool,
 }
@@ -201,6 +204,7 @@ impl GuiPaneCleanupOwner {
             admission_pending: AtomicBool::new(false),
             retry_pending: AtomicBool::new(false),
             allocation_pending: AtomicBool::new(false),
+            repaint_owed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             subscribed: AtomicBool::new(false),
         }
@@ -332,10 +336,12 @@ impl GuiPaneCleanupOwner {
                     // final occupied credit cannot race past this retained wake.
                     self.admission_pending.store(true, Ordering::Release);
                     self.allocation_pending.store(false, Ordering::Release);
+                    self.repaint_owed.store(true, Ordering::Release);
                     return Err(GuiPaneAdmissionError::Full);
                 }
                 if slots.try_reserve(1).is_err() {
                     self.allocation_pending.store(true, Ordering::Release);
+                    self.repaint_owed.store(true, Ordering::Release);
                     drop(slots);
                     self.wake();
                     return Err(GuiPaneAdmissionError::Allocation);
@@ -373,6 +379,10 @@ impl GuiPaneCleanupOwner {
         }
         self.wake();
         true
+    }
+
+    fn take_repaint_owed(&self) -> bool {
+        self.repaint_owed.swap(false, Ordering::AcqRel)
     }
 
     fn pending_registration(&self) -> Option<mux::PaneRegistrationHandle> {
@@ -5438,12 +5448,19 @@ impl TermWindow {
                         window,
                     )
                 });
+                // Empty retained wakes include credit returns: retry visible
+                // state admission through the ordinary paced native repaint.
+                // Output from panes that are not on screen repaints nothing
+                // else here; the visible-pane check below repaints for those.
+                // Painting for every pane's output made the GUI redraw an
+                // identical frame at the display rate whenever any background
+                // tab was busy.
+                if !matches!(cleanup_result, Ok(false)) || pane_cleanup.take_repaint_owed() {
+                    actions.request_repaint();
+                }
                 if let Err(error) = cleanup_result {
                     log::error!("retained GUI pane cleanup failed; owner will retry: {error:#}");
                 }
-                // Empty retained wakes include credit returns: retry visible
-                // state admission through the ordinary paced native repaint.
-                actions.request_repaint();
                 if reconcile
                     || attached_tabs
                         .as_ref()
