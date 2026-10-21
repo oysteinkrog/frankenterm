@@ -1428,15 +1428,16 @@ impl RenderableInner {
         );
         self.seqno = delta.seqno;
 
-        let mut hyperlink_rows = Vec::with_capacity(bonus_lines.len());
+        // Implicit hyperlinks are scanned when a row is painted
+        // (get_lines_with_hyperlinks), not here. Scanning every pushed row ran
+        // the hyperlink regexes for background panes and for rows that are
+        // pushed again unchanged, which cost about a tenth of the GUI main
+        // thread with busy background tabs.
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
-            if self.put_line(stable_row, line, None) {
-                hyperlink_rows.push(stable_row);
-            }
+            self.put_line(stable_row, line, None);
             dirty.remove(stable_row);
         }
-        self.normalize_current_implicit_hyperlinks_for_rows(hyperlink_rows);
 
         let mut to_fetch = RangeSet::new();
         let mut fetch_token = None;
@@ -1818,14 +1819,6 @@ impl RenderableInner {
         } else {
             self.normalize_implicit_hyperlinks_for_rows(touched_rows, rules);
         }
-    }
-
-    fn normalize_current_implicit_hyperlinks_for_rows(
-        &mut self,
-        touched_rows: impl IntoIterator<Item = StableRowIndex>,
-    ) {
-        let rules = self.implicit_hyperlink_rules.clone();
-        self.normalize_implicit_hyperlinks_for_rows(touched_rows, &rules);
     }
 
     fn put_line(
@@ -2488,7 +2481,7 @@ impl RenderableInner {
         fetch_token: &FetchToken,
     ) {
         let (lines, incomplete_rows) = hydrated.into_parts();
-        let mut hyperlink_rows = Vec::with_capacity(lines.len());
+        // As for pushed rows, implicit hyperlinks are scanned at paint time.
         for (stable_row, line) in lines {
             if incomplete_rows.contains(&stable_row) {
                 // Preserve the last complete image composition. The exact-token
@@ -2496,13 +2489,10 @@ impl RenderableInner {
                 // request that started while image hydration was suspended.
                 continue;
             }
-            if self.put_line(stable_row, line, Some(fetch_token)) {
-                hyperlink_rows.push(stable_row);
-            }
+            self.put_line(stable_row, line, Some(fetch_token));
         }
         // Omitted rows must not remain Fetching forever either.
         self.release_exact_fetch_reservations(requested, fetch_token);
-        self.normalize_current_implicit_hyperlinks_for_rows(hyperlink_rows);
     }
 
     fn admit_fetched_layout(
