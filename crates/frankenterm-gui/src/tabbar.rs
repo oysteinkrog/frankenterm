@@ -2,8 +2,11 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors, TabBarPosition};
 pub use frankenterm_gui::status_text::{parse_status_text, parse_status_text_with_cell_limit};
 use mlua::{FromLua, IntoLua};
+use mux::tab::TabId;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, unicode_column_width};
 use termwiz::color::{AnsiColor, ColorSpec};
 use termwiz::surface::SEQ_ZERO;
@@ -72,11 +75,18 @@ struct TitleText {
 /// they are built once, on the first call, and shared by every tab of this
 /// bar instead of being rebuilt for each tab. With no handler registered
 /// nothing is converted at all.
+///
+/// Each handler result is also kept per tab (see `TabTitleMemo`), so a
+/// refresh caused by one busy tab does not run the handler for every other
+/// tab again.
 struct TabTitleFormatter<'a> {
     tab_info: &'a [TabInformation],
     pane_info: &'a [PaneInformation],
     config: &'a ConfigHandle,
     state: FormatterState,
+    /// Memo keys this tab bar used, so entries for closed tabs and old
+    /// widths can be dropped.
+    used: Vec<TabTitleMemoKey>,
 }
 
 enum FormatterState {
@@ -101,8 +111,51 @@ struct ConfigLuaCache {
     value: mlua::Value,
 }
 
+/// The longest time a remembered `format-tab-title` result is reused.
+/// Handlers can read state that is not part of the memo key, such as other
+/// tabs, the clock or the pane's process, so such a title is at most this
+/// old when the tab bar refreshes.
+const TAB_TITLE_MEMO_MAX_AGE: Duration = Duration::from_secs(1);
+
+type TabTitleMemoKey = (TabId, bool, usize);
+
+/// One `format-tab-title` result, with the inputs it was computed from.
+/// Busy panes refresh the tab bar about ten times a second. Running the
+/// handler again for every tab whose own information has not changed was
+/// most of the GUI's main-thread time with dozens of tabs.
+struct TabTitleMemo {
+    tab: TabInformation,
+    tab_count: usize,
+    config: ConfigHandle,
+    lua: Weak<mlua::Lua>,
+    computed_at: Instant,
+    title: Option<TitleText>,
+}
+
+impl TabTitleMemo {
+    fn reusable(
+        &self,
+        tab: &TabInformation,
+        tab_count: usize,
+        config: &ConfigHandle,
+        lua: &Rc<mlua::Lua>,
+        now: Instant,
+    ) -> bool {
+        now.saturating_duration_since(self.computed_at) < TAB_TITLE_MEMO_MAX_AGE
+            && self.tab_count == tab_count
+            && self.config.same_config(config)
+            && self
+                .lua
+                .upgrade()
+                .is_some_and(|memo_lua| Rc::ptr_eq(&memo_lua, lua))
+            && self.tab == *tab
+    }
+}
+
 thread_local! {
     static CONFIG_LUA_CACHE: RefCell<Option<ConfigLuaCache>> = const { RefCell::new(None) };
+    static TAB_TITLE_MEMO: RefCell<HashMap<TabTitleMemoKey, TabTitleMemo>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Converting the whole config to Lua is the largest part of a tab bar
@@ -165,6 +218,24 @@ impl<'a> TabTitleFormatter<'a> {
             pane_info,
             config,
             state: FormatterState::Unprepared,
+            used: vec![],
+        }
+    }
+
+    /// The Lua state the handler runs in, without converting any arguments.
+    fn current_lua(&mut self) -> Option<Rc<mlua::Lua>> {
+        match &self.state {
+            FormatterState::Ready(args) => Some(args.lua.clone()),
+            FormatterState::Unavailable => None,
+            FormatterState::Unprepared => {
+                match config::run_immediate_with_lua_config(|lua| Ok(lua)) {
+                    Ok(Some(lua)) => Some(lua),
+                    Ok(None) | Err(_) => {
+                        self.state = FormatterState::Unavailable;
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -186,6 +257,22 @@ impl<'a> TabTitleFormatter<'a> {
         hover: bool,
         tab_max_width: usize,
     ) -> Option<TitleText> {
+        let lua = self.current_lua()?;
+        let key = (tab.tab_id, hover, tab_max_width);
+        let now = Instant::now();
+        let tab_count = self.tab_info.len();
+        let remembered = TAB_TITLE_MEMO.with(|memo| {
+            memo.borrow()
+                .get(&key)
+                .filter(|entry| entry.reusable(tab, tab_count, self.config, &lua, now))
+                .map(|entry| entry.title.clone())
+        });
+        self.used.push(key);
+        if let Some(title) = remembered {
+            metrics::histogram!("compute_tab_title.memo_hit").record(1.);
+            return title;
+        }
+
         if matches!(self.state, FormatterState::Unprepared) {
             self.state = match self.prepare() {
                 Ok(Some(args)) => FormatterState::Ready(args),
@@ -200,7 +287,22 @@ impl<'a> TabTitleFormatter<'a> {
             return None;
         };
         match Self::call_handler(args, tab, hover, tab_max_width) {
-            Ok(title) => title,
+            Ok(title) => {
+                TAB_TITLE_MEMO.with(|memo| {
+                    memo.borrow_mut().insert(
+                        key,
+                        TabTitleMemo {
+                            tab: tab.clone(),
+                            tab_count,
+                            config: self.config.clone(),
+                            lua: Rc::downgrade(&args.lua),
+                            computed_at: now,
+                            title: title.clone(),
+                        },
+                    );
+                });
+                title
+            }
             Err(err) => {
                 log::warn!("format-tab-title: {}", err);
                 None
@@ -245,6 +347,21 @@ impl<'a> TabTitleFormatter<'a> {
                 }))
             }
         }
+    }
+}
+
+impl Drop for TabTitleFormatter<'_> {
+    /// Keep the entries this tab bar used. Entries for tabs of other
+    /// windows are kept while they can still be reused.
+    fn drop(&mut self) {
+        let now = Instant::now();
+        TAB_TITLE_MEMO.with(|memo| {
+            memo.borrow_mut().retain(|key, entry| {
+                self.used.contains(key)
+                    || (now.saturating_duration_since(entry.computed_at) < TAB_TITLE_MEMO_MAX_AGE
+                        && !self.tab_info.iter().any(|tab| tab.tab_id == key.0))
+            })
+        });
     }
 }
 
@@ -1055,6 +1172,7 @@ end)
             pane_info: &[],
             config: &config,
             state: FormatterState::Ready(args),
+            used: vec![],
         };
 
         let titles: Vec<String> = tabs
@@ -1070,6 +1188,60 @@ end)
             seen.get::<bool>("same")?,
             "every call must get the same tabs, panes and config tables"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn format_tab_title_results_are_reused_while_the_tab_is_unchanged() -> anyhow::Result<()> {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let lua = lua_with_script(
+            r#"
+local wezterm = require 'wezterm'
+calls = 0
+wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
+  calls = calls + 1
+  return tab.tab_title .. '#' .. calls
+end)
+"#,
+        )?;
+        let calls = || lua.globals().get::<i64>("calls").unwrap();
+        let refresh = |tabs: &[TabInformation], hover: bool| -> anyhow::Result<Vec<String>> {
+            let args = FormatTabTitleArgs::build(lua.clone(), tabs, &[], &config)?
+                .expect("a format-tab-title handler is registered");
+            let mut formatter = TabTitleFormatter {
+                tab_info: tabs,
+                pane_info: &[],
+                config: &config,
+                state: FormatterState::Ready(args),
+                used: vec![],
+            };
+            Ok(tabs
+                .iter()
+                .map(|tab| title_text(formatter.call(tab, hover && tab.tab_id == 1, 20)))
+                .collect())
+        };
+
+        let mut tabs = test_tabs(3);
+        assert_eq!(refresh(&tabs, false)?, ["#1", "#2", "#3"]);
+        assert_eq!(refresh(&tabs, false)?, ["#1", "#2", "#3"], "unchanged tabs reuse their titles");
+        assert_eq!(calls(), 3);
+
+        tabs[2].tab_title = "busy".to_string();
+        assert_eq!(refresh(&tabs, false)?, ["#1", "#2", "busy#4"], "only the changed tab runs again");
+
+        assert_eq!(refresh(&tabs, true)?, ["#1", "#5", "busy#4"], "hover is part of the key");
+        assert_eq!(refresh(&tabs[..2], false)?, ["#6", "#7"], "a new tab count runs every tab");
+
+        TAB_TITLE_MEMO.with(|memo| {
+            for entry in memo.borrow_mut().values_mut() {
+                entry.computed_at -= TAB_TITLE_MEMO_MAX_AGE;
+            }
+        });
+        assert_eq!(refresh(&tabs[..2], false)?, ["#8", "#9"], "old results are not reused");
+
+        let closed = TAB_TITLE_MEMO.with(|memo| memo.borrow().keys().any(|key| key.0 == 2));
+        assert!(!closed, "entries for tabs that left the bar are dropped");
         Ok(())
     }
 

@@ -1338,7 +1338,7 @@ pub struct PaneState {
 }
 
 /// Data used when synchronously formatting pane and window titles
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TabInformation {
     pub tab_id: TabId,
     pub tab_index: usize,
@@ -1395,7 +1395,7 @@ impl UserData for TabInformation {
 }
 
 /// Data used when synchronously formatting pane and window titles
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaneInformation {
     title_metadata_is_stale: bool,
     pub pane_id: PaneId,
