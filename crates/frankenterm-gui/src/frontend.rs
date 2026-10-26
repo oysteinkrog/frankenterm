@@ -198,15 +198,18 @@ impl LayoutLifecycle {
                 // persist a competing freshly minted ID before restore runs.
                 continue;
             }
-            // Pure remote order belongs to its server. This store describes
-            // local/mixed composition only, including retained unavailable slots.
-            let pure_remote = slots.first().is_some_and(|first| match first {
-                StableTabSlot::Remote { binding_id, session_id, remote_window_id, .. } => slots.iter().all(|slot|
-                    matches!(slot, StableTabSlot::Remote { binding_id: b, session_id: s, remote_window_id: w, .. }
-                        if b == binding_id && s == session_id && w == remote_window_id)),
-                _ => false,
-            });
-            if old.is_none() && (pure_remote || slots.is_empty()) {
+            // Remote order and grouping belong to the server. This store
+            // describes windows that hold local tabs only, including retained
+            // unavailable slots. A window that now shows only remote tabs
+            // stops owning its overlay, so restore never acts on it again.
+            if slots.is_empty() {
+                if old.is_none() {
+                    continue;
+                }
+            } else if slots.iter().all(|slot| slot.remote_binding().is_some()) {
+                if old.is_some() {
+                    self.owned.remove(&id);
+                }
                 continue;
             }
             let active = order
@@ -307,17 +310,30 @@ impl LayoutLifecycle {
         let mut claimed_windows = std::collections::BTreeSet::new();
         let mut assignments = Vec::new();
         let mut builders = Vec::new();
+        let mut without_local_tabs = Vec::new();
         let result = (|| -> anyhow::Result<()> {
             for overlay in &self.startup.overlays {
                 if self.restored.contains(&overlay.window_id()) {
                     continue;
                 }
+                // Classify by the live tabs this overlay matched, never by its
+                // stored slots. Only local tabs are placed here: remote tabs
+                // follow their server's window grouping, so restore never
+                // moves one or opens a window for one.
                 let tabs: Vec<_> = overlay
                     .slots()
                     .iter()
                     .filter_map(|slot| by_identity.get(&slot.identity()).cloned())
+                    .filter(|tab| {
+                        live.slots
+                            .get(&tab.tab_id())
+                            .is_some_and(|slot| slot.remote_binding().is_none())
+                    })
                     .collect();
                 let Some(first) = tabs.first() else {
+                    // Nothing to place. Retire it for this run so resyncs do
+                    // not scan it again, and do not own its window.
+                    without_local_tabs.push(overlay.window_id());
                     continue;
                 };
                 let existing = self.owned.iter().find_map(|(&id, owned)| {
@@ -424,6 +440,7 @@ impl LayoutLifecycle {
         for builder in builders {
             builder.cancel();
         }
+        self.restored.extend(without_local_tabs);
         result
     }
 }
@@ -1831,6 +1848,206 @@ mod tests {
         }
         left.cancel();
         right.cancel();
+    }
+
+    /// A mux with one window per entry of `windows`, each holding that many
+    /// pane-less tabs, plus a live layout that reports every tab as a remote
+    /// tab of remote window 0, numbered from 1 in window order.
+    fn remote_layout_fixture(
+        windows: &[usize],
+    ) -> (
+        std::sync::Arc<mux::Mux>,
+        mux::activity::Activity,
+        Vec<mux::window::WindowId>,
+        Vec<std::sync::Arc<mux::tab::Tab>>,
+        super::LiveLayout,
+        crate::window_state_persist::LayoutStateSnapshot,
+        tempfile::TempDir,
+    ) {
+        use mux::tab::Tab;
+        use std::sync::Arc;
+        let mux = Arc::new(mux::Mux::new(None));
+        let activity = mux::activity::Activity::new_for_mux(&mux);
+        let mut ids = Vec::new();
+        let mut tabs = Vec::new();
+        for &count in windows {
+            let window = mux.new_empty_window(None, None);
+            let id = *window;
+            for _ in 0..count {
+                let tab = Arc::new(Tab::new(&Default::default()));
+                mux.add_tab_no_panes(&tab).unwrap();
+                mux.add_tab_to_window(&tab, id).unwrap();
+                tabs.push(tab);
+            }
+            drop(window);
+            ids.push(id);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let startup =
+            crate::window_state_persist::load_snapshot_at(&temp.path().join("layout.json"))
+                .unwrap();
+        let mut live = super::LiveLayout::capture(&mux, &startup).unwrap();
+        for (index, tab) in tabs.iter().enumerate() {
+            live.slots.insert(tab.tab_id(), remote_slot(0, index as u64 + 1));
+        }
+        (mux, activity, ids, tabs, live, startup, temp)
+    }
+
+    fn remote_slot(remote_window_id: u64, remote_tab_id: u64) -> super::StableTabSlot {
+        super::StableTabSlot::remote(
+            crate::window_state_persist::DomainBindingId::from_bytes([7; 16]),
+            super::StableMuxSessionId::from_bytes([9; 16]),
+            remote_window_id,
+            remote_tab_id,
+        )
+    }
+
+    fn window_tab_ids(mux: &mux::Mux, id: mux::window::WindowId) -> Vec<mux::tab::TabId> {
+        mux.window_order_snapshot(id)
+            .unwrap()
+            .unwrap()
+            .ordered_tab_ids()
+            .collect()
+    }
+
+    #[test]
+    fn restore_of_overlays_on_one_remote_window_keeps_one_window() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay};
+        // The observed case: four overlays all name tabs of remote window 0,
+        // one with 42 tabs and three with [57], [48] and [54, 55]. Before the
+        // fix each extra overlay split its tabs into a new OS window.
+        let (mux, _activity, ids, tabs, live, mut startup, _temp) =
+            remote_layout_fixture(&[60]);
+        let before = window_tab_ids(&mux, ids[0]);
+        let slot = |number: u64| live.slots[&tabs[number as usize - 1].tab_id()];
+        let mut groups: Vec<Vec<u64>> = vec![(1..=42).collect()];
+        groups.extend([vec![57], vec![48], vec![54, 55]]);
+        startup.overlays = groups
+            .iter()
+            .map(|group| {
+                let slots: Vec<_> = group.iter().map(|&n| slot(n)).collect();
+                let id = startup.new_layout_window_id().unwrap();
+                MixedDomainLayoutOverlay::new(id, "default", 3, slots.clone(), Some(slots[0]))
+                    .unwrap()
+            })
+            .collect();
+        let overlay_ids: Vec<_> = startup.overlays.iter().map(|o| o.window_id()).collect();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+        };
+        lifecycle.restore(&mux, &live).unwrap();
+        assert_eq!(mux.iter_windows(), ids);
+        assert_eq!(window_tab_ids(&mux, ids[0]), before);
+        assert!(lifecycle.owned.is_empty(), "remote-only overlays are not owned");
+        for id in overlay_ids {
+            assert!(lifecycle.restored.contains(&id), "not rescanned on resync");
+        }
+        // A resync runs restore again and still changes nothing.
+        lifecycle.restore(&mux, &live).unwrap();
+        assert_eq!(mux.iter_windows(), ids);
+        assert_eq!(window_tab_ids(&mux, ids[0]), before);
+    }
+
+    #[test]
+    fn restore_never_moves_remote_tabs_of_a_mixed_overlay() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay};
+        use std::sync::Arc;
+        // Window 0 holds remote tabs 1 and 2. Window 1 holds a local tab.
+        let (mux, _activity, ids, tabs, mut live, mut startup, _temp) =
+            remote_layout_fixture(&[2]);
+        let local_window = mux.new_empty_window(None, None);
+        let local_window_id = *local_window;
+        let local_tab = Arc::new(mux::tab::Tab::new(&Default::default()));
+        mux.add_tab_no_panes(&local_tab).unwrap();
+        mux.add_tab_to_window(&local_tab, local_window_id).unwrap();
+        drop(local_window);
+        let local_slot = super::StableTabSlot::local(
+            super::StableLocalSessionId::from_bytes([3; 16]),
+            super::StableLocalTabId::from_bytes(*local_tab.durable_id().as_bytes()),
+        );
+        live.slots.insert(local_tab.tab_id(), local_slot);
+        let stale_local = super::StableTabSlot::local(
+            super::StableLocalSessionId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
+            super::StableLocalTabId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
+        );
+        let remote = [live.slots[&tabs[0].tab_id()], live.slots[&tabs[1].tab_id()]];
+        // A stale local slot from an old session plus remote slots: nothing
+        // local matches, so nothing moves and the overlay is not owned.
+        let stale_id = startup.new_layout_window_id().unwrap();
+        // A live local tab listed with a remote tab: only the local tab may be
+        // placed; the remote tab stays in its server's window.
+        let mixed_id = startup.new_layout_window_id().unwrap();
+        startup.overlays = vec![
+            MixedDomainLayoutOverlay::new(
+                stale_id,
+                "default",
+                2,
+                vec![stale_local, remote[0], remote[1]],
+                Some(remote[1]),
+            )
+            .unwrap(),
+            MixedDomainLayoutOverlay::new(
+                mixed_id,
+                "default",
+                2,
+                vec![remote[1], local_slot],
+                Some(remote[1]),
+            )
+            .unwrap(),
+        ];
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+        };
+        lifecycle.restore(&mux, &live).unwrap();
+        let mut expected_windows = vec![ids[0], local_window_id];
+        expected_windows.sort_unstable();
+        let mut windows = mux.iter_windows();
+        windows.sort_unstable();
+        assert_eq!(windows, expected_windows, "no window was created");
+        assert_eq!(
+            window_tab_ids(&mux, ids[0]),
+            vec![tabs[0].tab_id(), tabs[1].tab_id()]
+        );
+        assert_eq!(window_tab_ids(&mux, local_window_id), vec![local_tab.tab_id()]);
+        assert!(lifecycle.restored.contains(&stale_id));
+        assert!(!lifecycle.owned.values().any(|o| o.overlay.window_id() == stale_id));
+        assert_eq!(
+            lifecycle.owned[&local_window_id].overlay.window_id(),
+            mixed_id
+        );
+    }
+
+    #[test]
+    fn capture_drops_an_overlay_whose_window_now_holds_only_remote_tabs() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow};
+        let (mux, _activity, ids, tabs, live, startup, _temp) = remote_layout_fixture(&[2]);
+        let slots = vec![live.slots[&tabs[0].tab_id()], live.slots[&tabs[1].tab_id()]];
+        let overlay_id = startup.new_layout_window_id().unwrap();
+        let overlay =
+            MixedDomainLayoutOverlay::new(overlay_id, "default", 4, slots.clone(), Some(slots[0]))
+                .unwrap();
+        let identity = mux.get_window(ids[0]).unwrap().durable_id();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+        };
+        lifecycle.restored.insert(overlay_id);
+        lifecycle.owned.insert(
+            ids[0],
+            OwnedLayoutWindow {
+                mux_identity: identity,
+                overlay,
+            },
+        );
+        // No storage writer is installed in tests: an attempted write would
+        // fail this call. Dropping ownership writes nothing.
+        lifecycle.capture_changes(&mux, &live).unwrap();
+        assert!(lifecycle.owned.is_empty());
     }
 
     #[test]

@@ -1524,6 +1524,39 @@ impl ClientInner {
         self.local_to_remote_window(local_window_id)
     }
 
+    /// A live local window in `workspace` that already shows a tab of
+    /// `remote_window_id`, using the tab owners of the snapshot being
+    /// applied. This is the reverse of [`Self::remote_window_for_local_window`].
+    /// The lowest window id wins so repeated resyncs pick the same window.
+    fn live_window_showing_remote_window(
+        &self,
+        mux: &Mux,
+        remote_window_id: WindowId,
+        remote_tab_owners: &HashMap<TabId, WindowId>,
+        workspace: Option<&str>,
+    ) -> Option<WindowId> {
+        let mut windows = mux.iter_windows();
+        windows.sort_unstable();
+        for local_window_id in windows {
+            // Copy tab ids under the `mux.windows` read guard and release it
+            // before taking any other lock.
+            let local_tab_ids = match mux.get_window(local_window_id) {
+                Some(window) if workspace.is_none_or(|name| window.get_workspace() == name) => {
+                    window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>()
+                }
+                _ => continue,
+            };
+            if local_tab_ids.into_iter().any(|local_tab_id| {
+                self.local_to_remote_tab(local_tab_id)
+                    .and_then(|remote_tab_id| remote_tab_owners.get(&remote_tab_id))
+                    == Some(&remote_window_id)
+            }) {
+                return Some(local_window_id);
+            }
+        }
+        None
+    }
+
     pub fn remote_to_local_pane_id(&self, mux: &Mux, remote_pane_id: PaneId) -> Option<PaneId> {
         let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
 
@@ -4907,6 +4940,28 @@ impl ClientDomain {
                         .remove(&remote_window_id);
                 }
 
+                // The mapping can be missing or stale while the GUI still shows
+                // this remote window: a reconnect expires mappings while the
+                // local window briefly holds no panes of this domain. Put the
+                // tab next to its siblings instead of opening a new window,
+                // and record the mapping again.
+                if let Some(local_window_id) = inner.live_window_showing_remote_window(
+                    mux,
+                    remote_window_id,
+                    &remote_tab_owners,
+                    workspace.as_deref(),
+                ) {
+                    log::debug!(
+                        "domain {}: remote window {} reuses local window {} that shows its tabs",
+                        inner.local_domain_id,
+                        remote_window_id,
+                        local_window_id
+                    );
+                    inner.record_remote_to_local_window_mapping(remote_window_id, local_window_id);
+                    mux.add_tab_to_window(&tab, local_window_id)?;
+                    continue;
+                }
+
                 if let Some(local_window_id) = primary_window_id {
                     // Verify that the workspace is consistent between the local and remote
                     // windows.
@@ -8155,6 +8210,82 @@ mod tests {
         .expect("resync should apply");
         assert_eq!(inner.remote_to_local_window(41), Some(other_window));
         assert_eq!(inner.local_to_remote_window(other_window), Some(41));
+    }
+
+    /// Remote tabs 51 and 52 of remote window 41, plus a new tab 53 in
+    /// `remote_window_id`, listed first so it is placed before its siblings.
+    fn listing_with_new_tab_53_first(remote_window_id: WindowId) -> ListPanesResponse {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(first) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        let mut second = first.clone();
+        second.tab_id = 52;
+        second.pane_id = 62;
+        let mut new_tab = first.clone();
+        new_tab.window_id = remote_window_id;
+        new_tab.tab_id = 53;
+        new_tab.pane_id = 63;
+        listing.tabs = vec![
+            PaneNode::Leaf(new_tab),
+            PaneNode::Leaf(first),
+            PaneNode::Leaf(second),
+        ];
+        let title = listing.tab_titles[0].clone();
+        listing.tab_titles = vec!["new tab".to_string(), title, "second tab".to_string()];
+        listing
+    }
+
+    #[test]
+    fn reconnect_with_expired_window_mapping_keeps_a_new_tab_in_the_existing_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_038);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window_id = inner.remote_to_local_window(41).expect("window maps");
+        // A reconnect expired the mapping while the window held no live panes.
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").remove(&41);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_new_tab_53_first(41),
+            None,
+        )
+        .expect("resync should apply");
+
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(window_id));
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+    }
+
+    #[test]
+    fn a_genuinely_new_remote_window_still_gets_its_own_local_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_039);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window_id = inner.remote_to_local_window(41).expect("window maps");
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").remove(&41);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_new_tab_53_first(42),
+            None,
+        )
+        .expect("resync should apply");
+
+        let new_window = inner.remote_to_local_window(42).expect("window 42 maps");
+        assert_ne!(new_window, window_id);
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(new_window));
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
     }
 
     #[test]
