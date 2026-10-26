@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use wezterm_term::TerminalSize;
@@ -253,6 +253,14 @@ pub struct ClientInner {
     /// longer has, such as a tab just moved by MovePaneToNewTab, which gets a
     /// new remote tab id. They commit again after the next topology resync.
     deferred_window_orders: Mutex<HashSet<WindowId>>,
+    /// Counts completed topology syncs, so an order commit can tell whether
+    /// the resync it waits for already happened after it read the order.
+    topology_generation: AtomicU64,
+    /// Resyncs requested for one window's order without the commit landing.
+    /// Bounds the retries when the mapping makes no progress.
+    order_resync_requests: Mutex<HashMap<WindowId, u8>>,
+    /// One order-triggered resync at a time; others defer behind it.
+    order_resync_in_flight: AtomicBool,
     order_lane: Mutex<Option<Arc<OrderLane>>>,
     topology_session: Mutex<ClientTopologySessionState>,
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
@@ -2021,6 +2029,9 @@ impl ClientInner {
             pending_window_titles: Mutex::new(HashMap::new()),
             pending_window_orders: Mutex::new(HashMap::new()),
             deferred_window_orders: Mutex::new(HashSet::new()),
+            topology_generation: AtomicU64::new(0),
+            order_resync_requests: Mutex::new(HashMap::new()),
+            order_resync_in_flight: AtomicBool::new(false),
             order_lane: Mutex::new(None),
             topology_session: Mutex::new(ClientTopologySessionState::Unbound),
             layout_tab_owners: Mutex::new(HashMap::new()),
@@ -2159,6 +2170,29 @@ impl ClientInner {
         if deferred.len() < 4_096 {
             deferred.insert(local_window_id);
         }
+    }
+
+    fn topology_generation(&self) -> u64 {
+        self.topology_generation.load(Ordering::Acquire)
+    }
+
+    /// Record one more resync requested for `local_window_id`'s order and
+    /// return how many were requested before this one.
+    fn note_order_resync_request(&self, local_window_id: WindowId) -> u8 {
+        let mut requests =
+            lock_or_recover(&self.order_resync_requests, "order_resync_requests");
+        if requests.len() >= 4_096 && !requests.contains_key(&local_window_id) {
+            return u8::MAX;
+        }
+        let count = requests.entry(local_window_id).or_insert(0);
+        let before = *count;
+        *count = count.saturating_add(1);
+        before
+    }
+
+    fn clear_order_resync_requests(&self, local_window_id: WindowId) {
+        lock_or_recover(&self.order_resync_requests, "order_resync_requests")
+            .remove(&local_window_id);
     }
 
     fn take_deferred_window_orders(&self) -> Vec<WindowId> {
@@ -2806,6 +2840,65 @@ fn client_attachment_is_current(mux: &Mux, domain_id: DomainId, inner: &Arc<Clie
         })
 }
 
+/// Resyncs one window's order may request before it gives up.
+const MAX_ORDER_RESYNC_REQUESTS: u8 = 3;
+/// Immediate retries within one commit run after a resync already landed.
+const MAX_IMMEDIATE_ORDER_RETRIES: u8 = 3;
+
+/// What an order commit that named an unknown remote tab does next.
+#[derive(Debug, PartialEq, Eq)]
+enum OrderRetry {
+    /// A topology sync finished after the order was read: retry at once.
+    Now,
+    /// No sync since the read: request one, then retry.
+    AfterResync,
+    /// The mapping made no progress across the allowed retries.
+    GiveUp,
+}
+
+fn order_retry_action(
+    generation_at_read: u64,
+    generation_now: u64,
+    immediate_retries: u8,
+    resyncs_requested: u8,
+) -> OrderRetry {
+    if generation_now != generation_at_read {
+        if immediate_retries < MAX_IMMEDIATE_ORDER_RETRIES {
+            return OrderRetry::Now;
+        }
+        return OrderRetry::GiveUp;
+    }
+    if resyncs_requested < MAX_ORDER_RESYNC_REQUESTS {
+        OrderRetry::AfterResync
+    } else {
+        OrderRetry::GiveUp
+    }
+}
+
+/// Run one coalesced topology resync for `inner`. Returns false when another
+/// order-triggered resync is already running; that one re-runs deferred
+/// windows when it finishes.
+async fn resync_for_window_order(mux: &Arc<Mux>, domain_id: DomainId, inner: &Arc<ClientInner>) -> bool {
+    if inner.order_resync_in_flight.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let domain = mux.get_domain(domain_id);
+    if let Some(client) = domain
+        .as_ref()
+        .and_then(|domain| domain.downcast_ref::<ClientDomain>())
+    {
+        let rpc = inner.client.rpc_scope();
+        if let Err(error) = client
+            .resync_if_current(Arc::clone(mux), Arc::clone(inner), &rpc)
+            .await
+        {
+            log::warn!("resync for a pending tab order failed: {error:#}");
+        }
+    }
+    inner.order_resync_in_flight.store(false, Ordering::Release);
+    true
+}
+
 /// Whether a commit named a remote tab the server no longer knows. A tab
 /// moved on the server gets a new remote tab id, and the local mapping only
 /// learns it at the next resync, so such a commit is retried after it.
@@ -2828,11 +2921,15 @@ async fn run_window_order_commits(
     pending: PendingWindowOrder,
 ) {
     let local_window_id = pending.local_window_id;
+    let mut immediate_retries = 0u8;
     loop {
         if !client_attachment_is_current(&mux, domain_id, &inner) {
             return;
         }
         pending.begin_update();
+        // Read before the order, so a sync that lands while the commit is in
+        // flight is seen afterwards and cannot be missed.
+        let generation_at_read = inner.topology_generation();
         let Some(desired) = inner.local_window_remote_order(&mux, local_window_id) else {
             log::debug!(
                 "window {local_window_id} does not mirror one server window; order not committed"
@@ -2865,14 +2962,50 @@ async fn run_window_order_commits(
                 }
                 if order_commit_waits_for_resync(&outcome) {
                     // The local order still names a tab under the remote id
-                    // it had before the server moved it. Try again once the
-                    // resync has mapped the new id, instead of dropping it.
-                    log::debug!(
-                        "tab order for window {local_window_id} waits for the next resync: {outcome:?}"
-                    );
-                    inner.defer_window_order(local_window_id);
-                    return;
+                    // it had before the server moved it. Retry once a resync
+                    // has mapped the new id, instead of dropping it.
+                    let resyncs = lock_or_recover(
+                        &inner.order_resync_requests,
+                        "order_resync_requests",
+                    )
+                    .get(&local_window_id)
+                    .copied()
+                    .unwrap_or(0);
+                    match order_retry_action(
+                        generation_at_read,
+                        inner.topology_generation(),
+                        immediate_retries,
+                        resyncs,
+                    ) {
+                        OrderRetry::Now => {
+                            immediate_retries += 1;
+                            continue;
+                        }
+                        OrderRetry::AfterResync => {
+                            log::debug!(
+                                "tab order for window {local_window_id} waits for a resync: {outcome:?}"
+                            );
+                            inner.note_order_resync_request(local_window_id);
+                            // Our own pending entry would swallow the deferred
+                            // re-run, so retry in this task after our resync.
+                            if resync_for_window_order(&mux, domain_id, &inner).await {
+                                continue;
+                            }
+                            // Another resync is running and re-runs deferred
+                            // windows when it finishes; this task ends first.
+                            inner.defer_window_order(local_window_id);
+                            return;
+                        }
+                        OrderRetry::GiveUp => {
+                            log::warn!(
+                                "tab order for window {local_window_id} was not committed: the server still does not know a tab after resyncs ({outcome:?})"
+                            );
+                            inner.clear_order_resync_requests(local_window_id);
+                            return;
+                        }
+                    }
                 }
+                inner.clear_order_resync_requests(local_window_id);
                 match &outcome {
                     WindowOrderCommitOutcome::Applied { .. } => {}
                     WindowOrderCommitOutcome::Unchanged { .. } => {}
@@ -3934,6 +4067,7 @@ impl ClientDomain {
             })
             .map_err(anyhow::Error::new)??;
         domain.refresh_layout_snapshot(&mux, &inner);
+        inner.topology_generation.fetch_add(1, Ordering::AcqRel);
         for local_window_id in inner.take_deferred_window_orders() {
             if mux.get_window(local_window_id).is_some() {
                 domain.commit_local_window_order(local_window_id);
@@ -6584,7 +6718,26 @@ mod tests {
             &WindowOrderCommitOutcome::Malformed
         ));
 
+        // A sync that landed after the order was read means retry at once,
+        // even though the deferred set it drained was empty then.
+        assert_eq!(order_retry_action(4, 5, 0, 0), OrderRetry::Now);
+        assert_eq!(
+            order_retry_action(4, 5, MAX_IMMEDIATE_ORDER_RETRIES, 0),
+            OrderRetry::GiveUp
+        );
+        // No sync since the read: ask for one, but only a bounded number of
+        // times without progress.
+        assert_eq!(order_retry_action(4, 4, 0, 0), OrderRetry::AfterResync);
+        assert_eq!(
+            order_retry_action(4, 4, 0, MAX_ORDER_RESYNC_REQUESTS),
+            OrderRetry::GiveUp
+        );
+
         let inner = test_client_inner(91_040);
+        assert_eq!(inner.note_order_resync_request(18), 0);
+        assert_eq!(inner.note_order_resync_request(18), 1);
+        inner.clear_order_resync_requests(18);
+        assert_eq!(inner.note_order_resync_request(18), 0);
         inner.defer_window_order(18);
         inner.defer_window_order(17);
         inner.defer_window_order(18);
