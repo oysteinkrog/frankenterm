@@ -3014,6 +3014,16 @@ impl TermWindow {
         }
     }
 
+    /// Kill a window the user closed on purpose, and delete its saved
+    /// layout so it does not come back on the next restore. Quit and
+    /// disconnect do not come through here and keep the layout.
+    fn kill_window_closed_by_user(mux: &Mux, window_id: MuxWindowId) {
+        mux.kill_window(window_id);
+        if let Some(front_end) = try_front_end() {
+            front_end.retire_layout_windows(&[window_id]);
+        }
+    }
+
     fn close_requested(&mut self, window: &Window) {
         let Some(mux) = Mux::try_get() else {
             log::warn!("closing GUI window without an active mux");
@@ -3026,7 +3036,7 @@ impl TermWindow {
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
                 // Immediately kill the tabs and allow the window to close
-                mux.kill_window(self.mux_window_id);
+                Self::kill_window_closed_by_user(&mux, self.mux_window_id);
                 window.close();
                 if let Some(front_end) = try_front_end() {
                     front_end.forget_known_window(window);
@@ -3036,7 +3046,7 @@ impl TermWindow {
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => {
-                        mux.kill_window(self.mux_window_id);
+                        Self::kill_window_closed_by_user(&mux, self.mux_window_id);
                         window.close();
                         if let Some(front_end) = try_front_end() {
                             front_end.forget_known_window(window);
@@ -3051,7 +3061,7 @@ impl TermWindow {
                     .window_can_close_without_prompting(mux_window_id)
                     .unwrap_or(false);
                 if can_close {
-                    mux.kill_window(self.mux_window_id);
+                    Self::kill_window_closed_by_user(&mux, self.mux_window_id);
                     window.close();
                     if let Some(front_end) = try_front_end() {
                         front_end.forget_known_window(window);
@@ -8464,6 +8474,11 @@ impl TermWindow {
             }
         }
 
+        // The emptied windows were merged on purpose: delete their saved
+        // layouts in one batch with the windows that took their tabs.
+        if let Some(front_end) = try_front_end() {
+            front_end.retire_layout_windows(&plan.close_windows);
+        }
         for window_id in plan.close_windows {
             mux.kill_window(window_id);
         }

@@ -64,6 +64,13 @@ use crate::window_state_persist::{
 };
 use frankenterm_client::domain::{ClientDomain, RemoteLayoutSnapshot};
 
+type LayoutUpdates = Vec<(Option<u64>, MixedDomainLayoutOverlay)>;
+type LayoutDeletes = Vec<(LayoutWindowId, u64)>;
+
+fn queue_layout_changes(updates: LayoutUpdates, deletes: LayoutDeletes) -> anyhow::Result<()> {
+    crate::window_state_persist::queue_layout_overlay_changes(updates, deletes).map_err(Into::into)
+}
+
 struct OwnedLayoutWindow {
     mux_identity: uuid::Uuid,
     overlay: MixedDomainLayoutOverlay,
@@ -162,9 +169,42 @@ impl LiveLayout {
 
 impl LayoutLifecycle {
     fn capture_changes(&mut self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<()> {
+        self.capture_and_retire(mux, live, &[], queue_layout_changes)
+    }
+
+    /// Capture every window's layout, and delete the overlays of `retiring`:
+    /// windows the user closed on purpose or that "Unify" emptied. The
+    /// deletes go in one batch with the receiving windows' updates, so a
+    /// window can claim tabs a retired overlay still lists.
+    fn capture_and_retire(
+        &mut self,
+        mux: &Arc<Mux>,
+        live: &LiveLayout,
+        retiring: &[MuxWindowId],
+        queue: impl FnOnce(LayoutUpdates, LayoutDeletes) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let mut updates = Vec::new();
         let mut next_owned = Vec::new();
+        let mut deletes = Vec::new();
+        let mut retired = Vec::new();
+        for &id in retiring {
+            let Some(owned) = self.owned.get(&id) else {
+                continue;
+            };
+            // A window id reused by a newer window is not the one retired.
+            if mux
+                .get_window(id)
+                .is_some_and(|window| window.durable_id() != owned.mux_identity)
+            {
+                continue;
+            }
+            deletes.push((owned.overlay.window_id(), owned.overlay.local_revision()));
+            retired.push(id);
+        }
         for id in mux.iter_windows_bounded(4_096)? {
+            if retired.contains(&id) {
+                continue;
+            }
             let Some(order) = mux.window_order_snapshot(id)? else {
                 continue;
             };
@@ -256,12 +296,19 @@ impl LayoutLifecycle {
                 },
             ));
         }
-        if updates.is_empty() {
+        if updates.is_empty() && deletes.is_empty() {
             return Ok(());
         }
-        live.with_current(mux, || {
-            crate::window_state_persist::queue_layout_overlays(updates).map_err(Into::into)
-        })?;
+        live.with_current(mux, || queue(updates, deletes.clone()))?;
+        for id in retired {
+            self.owned.remove(&id);
+        }
+        for (window_id, _) in deletes {
+            self.startup
+                .overlays
+                .retain(|overlay| overlay.window_id() != window_id);
+            self.restored.remove(&window_id);
+        }
         for (id, owned) in next_owned {
             // A local edit supersedes the startup placement, including edits
             // made while another domain is unavailable.
@@ -744,6 +791,29 @@ impl GuiFrontEnd {
             log::warn!(
                 "mixed layout reconciliation unavailable; preserving live sessions: {error:#}"
             );
+        }
+    }
+
+    /// Delete the saved layout of windows the user removed on purpose: a
+    /// window closed by the user, or one that "Unify" emptied. Call it after
+    /// the tabs have moved and before or after the window is gone, never on
+    /// quit or disconnect, which must keep the layout.
+    pub fn retire_layout_windows(&self, windows: &[MuxWindowId]) {
+        if windows.is_empty() || self.applying_layout.replace(true) {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let mux = Mux::try_get().context("layout mux is unavailable")?;
+            let mut lifecycle = self.layout_lifecycle.borrow_mut();
+            let Some(lifecycle) = lifecycle.as_mut() else {
+                return Ok(());
+            };
+            let live = LiveLayout::capture(&mux, &lifecycle.startup)?;
+            lifecycle.capture_and_retire(&mux, &live, windows, queue_layout_changes)
+        })();
+        self.applying_layout.set(false);
+        if let Err(error) = result {
+            log::warn!("could not delete the saved layout of closed windows: {error:#}");
         }
     }
 
@@ -2044,10 +2114,119 @@ mod tests {
                 overlay,
             },
         );
-        // No storage writer is installed in tests: an attempted write would
-        // fail this call. Dropping ownership writes nothing.
-        lifecycle.capture_changes(&mux, &live).unwrap();
+        // Dropping ownership writes nothing.
+        lifecycle
+            .capture_and_retire(&mux, &live, &[], |updates, deletes| {
+                assert!(updates.is_empty() && deletes.is_empty());
+                Ok(())
+            })
+            .unwrap();
         assert!(lifecycle.owned.is_empty());
+    }
+
+    #[test]
+    fn retiring_a_window_deletes_its_overlay_in_one_batch_with_the_receiver() {
+        use super::{LayoutLifecycle, LiveLayout, MixedDomainLayoutOverlay, OwnedLayoutWindow};
+        use mux::tab::Tab;
+        use std::sync::{Arc, Mutex};
+        let mux = Arc::new(mux::Mux::new(None));
+        let _activity = mux::activity::Activity::new_for_mux(&mux);
+        let emptied = mux.new_empty_window(None, None);
+        let receiver = mux.new_empty_window(None, None);
+        let ids = [*emptied, *receiver];
+        let tabs: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let tab = Arc::new(Tab::new(&Default::default()));
+                mux.add_tab_no_panes(&tab).unwrap();
+                mux.add_tab_to_window(&tab, id).unwrap();
+                tab
+            })
+            .collect();
+        let temp = tempfile::tempdir().unwrap();
+        let mut startup =
+            crate::window_state_persist::load_snapshot_at(&temp.path().join("layout.json"))
+                .unwrap();
+        let live = LiveLayout::capture(&mux, &startup).unwrap();
+        let slots: Vec<_> = tabs.iter().map(|tab| live.slots[&tab.tab_id()]).collect();
+        let overlays: Vec<_> = [(2, slots[0]), (1, slots[1])]
+            .into_iter()
+            .map(|(revision, slot)| {
+                let id = startup.new_layout_window_id().unwrap();
+                MixedDomainLayoutOverlay::new(id, "default", revision, vec![slot], Some(slot))
+                    .unwrap()
+            })
+            .collect();
+        startup.overlays = overlays.clone();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+        };
+        for (&id, overlay) in ids.iter().zip(&overlays) {
+            lifecycle.restored.insert(overlay.window_id());
+            lifecycle.owned.insert(
+                id,
+                OwnedLayoutWindow {
+                    mux_identity: mux.get_window(id).unwrap().durable_id(),
+                    overlay: overlay.clone(),
+                },
+            );
+        }
+
+        // Without an explicit retirement (quit, disconnect, a plain topology
+        // change) an emptied window keeps its overlay: nothing is deleted.
+        mux.move_tab_between_windows(tabs[0].tab_id(), ids[1], None)
+            .unwrap();
+        let live = LiveLayout::capture(&mux, &lifecycle.startup).unwrap();
+        let queued = Mutex::new(Vec::new());
+        let mut plain = LayoutLifecycle {
+            startup: lifecycle.startup.clone(),
+            owned: lifecycle
+                .owned
+                .iter()
+                .map(|(&id, owned)| {
+                    (
+                        id,
+                        OwnedLayoutWindow {
+                            mux_identity: owned.mux_identity,
+                            overlay: owned.overlay.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            restored: lifecycle.restored.clone(),
+        };
+        plain
+            .capture_and_retire(&mux, &live, &[], |_, deletes| {
+                queued.lock().unwrap().push(deletes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*queued.lock().unwrap(), vec![Vec::new()]);
+
+        // "Unify" emptied the window: its overlay goes in the same batch as
+        // the receiver's update that claims its tab.
+        let recorded = Mutex::new(None);
+        lifecycle
+            .capture_and_retire(&mux, &live, &[ids[0]], |updates, deletes| {
+                *recorded.lock().unwrap() = Some((updates, deletes));
+                Ok(())
+            })
+            .unwrap();
+        let (updates, deletes) = recorded.into_inner().unwrap().unwrap();
+        assert_eq!(deletes, vec![(overlays[0].window_id(), 2)]);
+        assert_eq!(updates.len(), 1);
+        let (base, update) = &updates[0];
+        assert_eq!(*base, Some(1));
+        assert_eq!(update.window_id(), overlays[1].window_id());
+        assert!(update.slots().contains(&slots[0]) && update.slots().contains(&slots[1]));
+        assert!(!lifecycle.owned.contains_key(&ids[0]));
+        assert!(lifecycle.owned.contains_key(&ids[1]));
+        assert!(lifecycle.startup.overlay(overlays[0].window_id()).is_none());
+        assert!(!lifecycle.restored.contains(&overlays[0].window_id()));
+        emptied.cancel();
+        receiver.cancel();
     }
 
     #[test]

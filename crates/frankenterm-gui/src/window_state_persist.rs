@@ -1873,7 +1873,19 @@ impl PersistenceWriter {
         &self,
         overlays: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
     ) -> Result<(), PersistenceFailure> {
-        if overlays.len() > MAX_LAYOUT_OVERLAYS {
+        self.queue_overlay_changes(overlays, Vec::new())
+    }
+
+    /// Like [`Self::queue_overlays`], plus retirement of exact live overlay
+    /// revisions in the same batch. A window that receives the tabs of a
+    /// retired window can then claim them, because both halves of the
+    /// hand-off are admitted together.
+    pub fn queue_overlay_changes(
+        &self,
+        overlays: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
+        deletes: Vec<(LayoutWindowId, u64)>,
+    ) -> Result<(), PersistenceFailure> {
+        if overlays.len().saturating_add(deletes.len()) > MAX_LAYOUT_OVERLAYS {
             return Err(PersistenceFailure::quota(
                 "layout batch has too many windows",
             ));
@@ -1885,10 +1897,18 @@ impl PersistenceWriter {
                 return Err(PersistenceFailure::invalid("layout batch repeats a window"));
             }
         }
+        for (window_id, _) in &deletes {
+            if !seen.insert(*window_id) {
+                return Err(PersistenceFailure::invalid("layout batch repeats a window"));
+            }
+        }
         let mut pending = lock_pending(&self.shared.pending);
         let mut next = pending.batch.clone();
         for (base, overlay) in overlays {
             next.queue_overlay_live(base, overlay)?;
+        }
+        for (window_id, revision) in deletes {
+            next.queue_overlay_delete(window_id, Some(revision))?;
         }
         self.wake_worker()?;
         pending.batch = next;
@@ -7308,6 +7328,15 @@ pub fn queue_layout_overlays(
     overlays: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
 ) -> Result<(), PersistenceFailure> {
     global_writer()?.queue_overlays(overlays)
+}
+
+/// Queue overlay updates and retirements as one atomic admission on the
+/// default worker. See [`PersistenceWriter::queue_overlay_changes`].
+pub fn queue_layout_overlay_changes(
+    overlays: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
+    deletes: Vec<(LayoutWindowId, u64)>,
+) -> Result<(), PersistenceFailure> {
+    global_writer()?.queue_overlay_changes(overlays, deletes)
 }
 
 /// Queue retirement of one exact live overlay revision on the default worker.
@@ -15988,6 +16017,66 @@ mod tests {
             load_snapshot_at(&path).expect("load after rejection"),
             before
         );
+    }
+
+    #[test]
+    fn overlay_changes_hand_tabs_of_a_retired_window_to_its_receiver_in_one_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let writer = PersistenceWriter::open(path.clone()).expect("writer");
+        let flush = |writer: &PersistenceWriter| {
+            writer
+                .flush()
+                .expect("flush receiver")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("flush response")
+                .expect("flush success")
+        };
+        let emptied = window_id(1);
+        let receiver = window_id(2);
+        let slot = local_slot(42);
+        writer
+            .queue_overlays(vec![
+                (None, local_overlay(emptied, 1, 42)),
+                (None, empty_overlay(receiver, 1)),
+            ])
+            .expect("queue both windows");
+        flush(&writer);
+
+        // The receiver alone cannot claim a tab the emptied window still owns.
+        let claim = |revision| {
+            MixedDomainLayoutOverlay::new(receiver, "default", revision, vec![slot], Some(slot))
+                .expect("receiver overlay")
+        };
+        writer
+            .queue_overlay_changes(vec![(Some(1), claim(2))], Vec::new())
+            .expect("queue the claim alone");
+        writer
+            .flush()
+            .expect("flush receiver")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flush response")
+            .expect_err("the store refuses a claim on a tab another window owns");
+        let after_claim = load_snapshot_at(&path).expect("load");
+        assert!(after_claim.overlay(emptied).is_some());
+        assert!(
+            after_claim
+                .overlay(receiver)
+                .is_some_and(|overlay| overlay.slots().is_empty()),
+            "the claim alone is refused"
+        );
+
+        // With the retirement in the same batch the hand-off commits.
+        drop(writer);
+        let writer = PersistenceWriter::open(path.clone()).expect("reopened writer");
+        writer
+            .queue_overlay_changes(vec![(Some(1), claim(2))], vec![(emptied, 1)])
+            .expect("queue claim and retirement together");
+        flush(&writer);
+        let after = load_snapshot_at(&path).expect("load");
+        assert!(after.overlay(emptied).is_none());
+        assert!(after.tombstone(emptied).is_some());
+        assert_eq!(after.overlay(receiver).map(|o| o.slots()), Some(&[slot][..]));
     }
 
     #[test]

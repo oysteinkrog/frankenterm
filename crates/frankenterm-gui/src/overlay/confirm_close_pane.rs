@@ -76,6 +76,9 @@ pub fn confirm_close_window(
                     log::warn!(
                         "cannot close window {mux_window_id}: exact originating tab generation is no longer attached"
                     );
+                } else if let Some(front_end) = crate::frontend::try_front_end() {
+                    // The user closed this window on purpose: forget its layout.
+                    front_end.retire_layout_windows(&[mux_window_id]);
                 }
             })
             .detach();
