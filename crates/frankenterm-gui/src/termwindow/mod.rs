@@ -57,6 +57,9 @@ use frankenterm_gui::floating_panes::{
 use frankenterm_gui::terminal_pane_id_to_u64;
 use frankenterm_gui::triple_buffer_gui::TerminalStateTripleBufferRegistry;
 use frankenterm_toast_notification::persistent_toast_notification;
+use frankenterm_gui::tab_move_route::{
+    TabMoveRoute, TabMoveSource, TabMoveTarget, TabMoveTargetWindow, route_tab_move,
+};
 use futures::future::{AbortHandle, AbortRegistration, Abortable};
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -7954,6 +7957,56 @@ impl TermWindow {
         self.show_launcher_impl(args, 0);
     }
 
+    /// Whether `tab` comes from a mux server, and how many panes it has.
+    fn tab_move_source(mux: &Mux, tab: &Tab) -> TabMoveSource {
+        let panes = tab.iter_all_panes();
+        let remote_domain = panes.iter().map(|pane| pane.domain_id()).find(|domain_id| {
+            mux.get_domain(*domain_id).is_some_and(|domain| {
+                domain
+                    .downcast_ref::<frankenterm_client::domain::ClientDomain>()
+                    .is_some()
+            })
+        });
+        match remote_domain {
+            Some(domain) => TabMoveSource::Remote {
+                domain,
+                pane_count: panes.len(),
+            },
+            None => TabMoveSource::Local,
+        }
+    }
+
+    /// What `window_id` shows, seen from the client domain `domain`.
+    fn tab_move_target_window(
+        mux: &Mux,
+        domain: mux::domain::DomainId,
+        window_id: MuxWindowId,
+    ) -> TabMoveTargetWindow {
+        // Copy the tabs under the window read guard and release it before
+        // asking the domain, which reads the window again.
+        let tabs: Vec<Arc<Tab>> = mux
+            .get_window(window_id)
+            .map(|window| window.iter().cloned().collect())
+            .unwrap_or_default();
+        let foreign_tabs = tabs
+            .iter()
+            .filter(|tab| {
+                let panes = tab.iter_all_panes();
+                panes.is_empty() || panes.iter().any(|pane| pane.domain_id() != domain)
+            })
+            .count();
+        let remote_windows = mux.get_domain(domain).and_then(|domain| {
+            domain
+                .downcast_ref::<frankenterm_client::domain::ClientDomain>()
+                .and_then(|client| client.remote_windows_shown_by_local_window(window_id))
+                .map(|windows| windows.into_iter().collect())
+        });
+        TabMoveTargetWindow {
+            foreign_tabs,
+            remote_windows,
+        }
+    }
+
     /// Move the active tab into `target`, or into a new window when `target`
     /// is `None`, then focus the window it lands in. The mux can only move a
     /// pane, so a tab with several panes moves just its active pane.
@@ -7980,7 +8033,30 @@ impl TermWindow {
         // with it. A multi-pane tab keeps its title for the panes left behind.
         let carried_title = Some(source_tab.get_title())
             .filter(|title| !title.is_empty() && source_tab.iter_all_panes().len() == 1);
+        // A tab from a mux server moves on the server, so the GUI keeps
+        // mirroring the server's window grouping. Moves the server cannot
+        // express are refused rather than done in the GUI only.
+        let source = Self::tab_move_source(&mux, &source_tab);
         drop(source_tab);
+        let route = match source {
+            TabMoveSource::Local => TabMoveRoute::Local,
+            TabMoveSource::Remote { domain, .. } => {
+                let target_facts = match target {
+                    None => TabMoveTarget::NewWindow,
+                    Some(window_id) => TabMoveTarget::Window(Self::tab_move_target_window(
+                        &mux, domain, window_id,
+                    )),
+                };
+                match route_tab_move(source, &target_facts) {
+                    Ok(route) => route,
+                    Err(reason) => {
+                        persistent_toast_notification("Tab not moved", reason);
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let on_server = matches!(route, TabMoveRoute::Server { .. });
 
         match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Topology,
@@ -8001,7 +8077,15 @@ impl TermWindow {
                                     win.window.focus();
                                 }
                             }
-                            Err(err) => log::error!("failed to move tab to window: {err:#}"),
+                            Err(err) => {
+                                log::error!("failed to move tab to window: {err:#}");
+                                if on_server {
+                                    persistent_toast_notification(
+                                        "Tab not moved",
+                                        &format!("The mux server did not move the tab: {err:#}"),
+                                    );
+                                }
+                            }
                         }
                     })
                     .detach();

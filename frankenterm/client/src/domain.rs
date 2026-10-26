@@ -249,6 +249,10 @@ pub struct ClientInner {
     pub(crate) fetch_retry_coordinator: Arc<crate::pane::FetchRetryCoordinator>,
     pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
     pending_window_orders: Mutex<HashMap<WindowId, Arc<AtomicBool>>>,
+    /// Local windows whose order commit named a remote tab the server no
+    /// longer has, such as a tab just moved by MovePaneToNewTab, which gets a
+    /// new remote tab id. They commit again after the next topology resync.
+    deferred_window_orders: Mutex<HashSet<WindowId>>,
     order_lane: Mutex<Option<Arc<OrderLane>>>,
     topology_session: Mutex<ClientTopologySessionState>,
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
@@ -2008,6 +2012,7 @@ impl ClientInner {
             fetch_retry_coordinator: crate::pane::FetchRetryCoordinator::new(),
             pending_window_titles: Mutex::new(HashMap::new()),
             pending_window_orders: Mutex::new(HashMap::new()),
+            deferred_window_orders: Mutex::new(HashSet::new()),
             order_lane: Mutex::new(None),
             topology_session: Mutex::new(ClientTopologySessionState::Unbound),
             layout_tab_owners: Mutex::new(HashMap::new()),
@@ -2137,6 +2142,24 @@ impl ClientInner {
             local_window_id,
             dirty,
         })
+    }
+
+    /// Commit `local_window_id` again after the next topology resync.
+    fn defer_window_order(&self, local_window_id: WindowId) {
+        let mut deferred =
+            lock_or_recover(&self.deferred_window_orders, "deferred_window_orders");
+        if deferred.len() < 4_096 {
+            deferred.insert(local_window_id);
+        }
+    }
+
+    fn take_deferred_window_orders(&self) -> Vec<WindowId> {
+        let mut windows: Vec<_> =
+            lock_or_recover(&self.deferred_window_orders, "deferred_window_orders")
+                .drain()
+                .collect();
+        windows.sort_unstable();
+        windows
     }
 
     /// The pinned session of the main connection, when it is a current one.
@@ -2775,6 +2798,19 @@ fn client_attachment_is_current(mux: &Mux, domain_id: DomainId, inner: &Arc<Clie
         })
 }
 
+/// Whether a commit named a remote tab the server no longer knows. A tab
+/// moved on the server gets a new remote tab id, and the local mapping only
+/// learns it at the next resync, so such a commit is retried after it.
+fn order_commit_waits_for_resync(outcome: &WindowOrderCommitOutcome) -> bool {
+    matches!(
+        outcome,
+        WindowOrderCommitOutcome::UnknownTab(_)
+            | WindowOrderCommitOutcome::NotPureWindow(
+                crate::ordered_reorder::NotPureWindow::UnknownTab(_)
+            )
+    )
+}
+
 /// Commit one local window's order until no newer local move is pending.
 async fn run_window_order_commits(
     mux: Arc<Mux>,
@@ -2817,6 +2853,16 @@ async fn run_window_order_commits(
                         "tab order for window {local_window_id} was not committed: {outcome:?}"
                     );
                     inner.drop_order_lane(&lane);
+                    return;
+                }
+                if order_commit_waits_for_resync(&outcome) {
+                    // The local order still names a tab under the remote id
+                    // it had before the server moved it. Try again once the
+                    // resync has mapped the new id, instead of dropping it.
+                    log::debug!(
+                        "tab order for window {local_window_id} waits for the next resync: {outcome:?}"
+                    );
+                    inner.defer_window_order(local_window_id);
                     return;
                 }
                 match &outcome {
@@ -3348,6 +3394,37 @@ impl ClientDomain {
         }
     }
 
+    /// The server windows whose tabs `local_window_id` shows, from the latest
+    /// topology snapshot. Only tabs whose panes all belong to this attachment
+    /// count. `None` when the domain is detached or one of those tabs has no
+    /// known server window.
+    pub fn remote_windows_shown_by_local_window(
+        &self,
+        local_window_id: WindowId,
+    ) -> Option<HashSet<WindowId>> {
+        let inner = self.inner()?;
+        let mux = self.mux_owner.upgrade()?;
+        // Copy what is needed under the `mux.windows` read guard and release
+        // it before taking any other lock.
+        let tabs: Vec<Arc<Tab>> = mux.get_window(local_window_id)?.iter().cloned().collect();
+        let owners = lock_or_recover(&inner.layout_tab_owners, "layout_tab_owners").clone();
+        let mut windows = HashSet::new();
+        for tab in tabs {
+            let panes = tab.iter_all_panes();
+            let ours = !panes.is_empty()
+                && panes.iter().all(|pane| {
+                    pane.downcast_ref::<ClientPane>()
+                        .is_some_and(|client_pane| client_pane.belongs_to_client(&inner))
+                });
+            if !ours {
+                continue;
+            }
+            let remote_tab_id = inner.local_to_remote_tab(tab.tab_id())?;
+            windows.insert(*owners.get(&remote_tab_id)?);
+        }
+        Some(windows)
+    }
+
     pub fn layout_snapshot(&self) -> Option<Arc<RemoteLayoutSnapshot>> {
         let inner = self.inner()?;
         let snapshot = lock_or_recover(&inner.layout_snapshot, "layout_snapshot").clone();
@@ -3849,6 +3926,11 @@ impl ClientDomain {
             })
             .map_err(anyhow::Error::new)??;
         domain.refresh_layout_snapshot(&mux, &inner);
+        for local_window_id in inner.take_deferred_window_orders() {
+            if mux.get_window(local_window_id).is_some() {
+                domain.commit_local_window_order(local_window_id);
+            }
+        }
         Ok(prepared)
     }
 
@@ -6457,6 +6539,31 @@ mod tests {
         assert!(replacement.queue_window_title(17).is_some());
         assert!(replacement.queue_window_title(18).is_none());
         drop(other_window);
+    }
+
+    #[test]
+    fn an_order_commit_naming_a_moved_tab_waits_for_the_next_resync() {
+        use crate::ordered_reorder::NotPureWindow;
+        let moved = codec::RemoteTabId::new(77);
+        assert!(order_commit_waits_for_resync(
+            &WindowOrderCommitOutcome::NotPureWindow(NotPureWindow::UnknownTab(moved))
+        ));
+        assert!(order_commit_waits_for_resync(
+            &WindowOrderCommitOutcome::UnknownTab(moved)
+        ));
+        assert!(!order_commit_waits_for_resync(
+            &WindowOrderCommitOutcome::NotPureWindow(NotPureWindow::SpansWindows)
+        ));
+        assert!(!order_commit_waits_for_resync(
+            &WindowOrderCommitOutcome::Malformed
+        ));
+
+        let inner = test_client_inner(91_040);
+        inner.defer_window_order(18);
+        inner.defer_window_order(17);
+        inner.defer_window_order(18);
+        assert_eq!(inner.take_deferred_window_orders(), vec![17, 18]);
+        assert!(inner.take_deferred_window_orders().is_empty());
     }
 
     #[test]

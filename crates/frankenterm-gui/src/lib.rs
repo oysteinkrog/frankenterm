@@ -14,6 +14,7 @@ pub mod osc8_gui;
 pub mod plugins;
 pub mod renderer_slo;
 pub mod rollout_env;
+pub mod tab_move_route;
 pub mod window_state_persist;
 
 /// Release ordering shared with the GUI's banner and notification paths.
