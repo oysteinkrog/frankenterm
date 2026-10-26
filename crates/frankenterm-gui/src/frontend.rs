@@ -489,9 +489,13 @@ impl LayoutLifecycle {
     /// - An owned overlay keeps its ownership at the stored revision; the
     ///   next capture recomputes its update or slot release. One the store
     ///   never held is forgotten, and its window gets a new one.
-    /// - A startup overlay is replaced in place by the stored one. A refusal
-    ///   never adds an overlay to the startup list, so it can never turn into
-    ///   a restore that moves tabs back.
+    /// - A startup overlay is replaced in place by the stored one and marked
+    ///   restored. A refusal never adds an overlay to the startup list, and
+    ///   an overlay with a refused edit never takes part in a startup
+    ///   restore again, so the stored placement cannot pull a tab back from
+    ///   where the user moved it. The edit itself is not taken from the
+    ///   store: the next capture rebuilds it from the live windows, against
+    ///   the stored revision.
     /// - An explicit delete is sent again at the stored revision, or dropped
     ///   when the store no longer holds the overlay.
     fn resync_rejected_overlays(
@@ -524,6 +528,11 @@ impl LayoutLifecycle {
                 None => false,
             }
         });
+        for id in rejected {
+            if self.startup.overlay(*id).is_some() {
+                self.restored.insert(*id);
+            }
+        }
         for id in rejected {
             if !self.pending_deletes.contains_key(id) {
                 continue;
@@ -2510,6 +2519,64 @@ mod tests {
         assert_eq!(lifecycle.owned[&ids[0]].overlay, stored);
         assert!(!lifecycle.owned.contains_key(&usize::MAX));
         assert_eq!(lifecycle.startup.overlays, vec![stored]);
+    }
+
+    #[test]
+    fn a_refused_edit_never_lets_restore_pull_a_tab_back() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay};
+        // A startup overlay groups local tabs L and M with a remote slot of
+        // a domain that is not available yet, so it is not restored yet.
+        // The user then moves L to its own window, and that capture is
+        // refused by the store.
+        let (mux, _activity, ids, tabs, mut live, mut startup, _temp) =
+            remote_layout_fixture(&[2]);
+        let local = |tab: &mux::tab::Tab| {
+            super::StableTabSlot::local(
+                super::StableLocalSessionId::from_bytes([5; 16]),
+                super::StableLocalTabId::from_bytes(*tab.durable_id().as_bytes()),
+            )
+        };
+        let (slot_m, slot_l) = (local(&tabs[0]), local(&tabs[1]));
+        live.slots.insert(tabs[0].tab_id(), slot_m);
+        live.slots.insert(tabs[1].tab_id(), slot_l);
+        let other_window = mux.new_empty_window(None, None);
+        mux.move_tab_between_windows(tabs[1].tab_id(), *other_window, None)
+            .unwrap();
+        let waiting = remote_slot(9, 99);
+        let overlay_id = startup.new_layout_window_id().unwrap();
+        let stored = MixedDomainLayoutOverlay::new(
+            overlay_id,
+            "default",
+            2,
+            vec![slot_m, slot_l, waiting],
+            Some(slot_m),
+        )
+        .unwrap();
+        startup.overlays = vec![stored.clone()];
+        let durable = startup.clone();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
+        };
+
+        lifecycle.resync_rejected_overlays(
+            &std::collections::BTreeSet::from([overlay_id]),
+            &durable,
+        );
+        assert!(lifecycle.restored.contains(&overlay_id));
+        assert_eq!(lifecycle.startup.overlay(overlay_id), Some(&stored));
+
+        lifecycle.restore(&mux, &live).unwrap();
+        assert_eq!(window_tab_ids(&mux, ids[0]), vec![tabs[0].tab_id()]);
+        assert_eq!(
+            window_tab_ids(&mux, *other_window),
+            vec![tabs[1].tab_id()],
+            "L stays where the user put it"
+        );
+        other_window.cancel();
     }
 
     #[test]
