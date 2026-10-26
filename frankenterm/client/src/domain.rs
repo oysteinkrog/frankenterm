@@ -3596,6 +3596,7 @@ impl ClientDomain {
     /// Send `MovePaneToNewTab` for the exact pane and resolve the result.
     /// `remote_window_id` is the server window to move into, `None` for a
     /// new server window; `window_id` is the local window to place it in.
+    #[allow(clippy::too_many_arguments)]
     async fn move_pane_exact(
         &self,
         mux: &Arc<Mux>,
@@ -3604,6 +3605,7 @@ impl ClientDomain {
         window_id: Option<WindowId>,
         remote_window_id: Option<WindowId>,
         workspace_for_new_window: Option<String>,
+        validated_remote_window: Option<WindowId>,
     ) -> anyhow::Result<MoveCommitReceipt> {
         let remote_pane_id = Self::exact_remote_pane_id(pane_guard, inner, "move target")?;
         let rpc = inner.client.rpc_scope();
@@ -3639,8 +3641,24 @@ impl ClientDomain {
                 .get_tab(local_tab_id)
                 .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
             let local_win_id = match window_id {
-                Some(requested) => {
+                Some(requested)
+                    if self.keeps_validated_placement(requested, validated_remote_window) =>
+                {
                     place_tab_in_requested_window(mux, &tab, requested)?;
+                    mux.window_containing_tab(local_tab_id)
+                        .unwrap_or(local_win_id)
+                }
+                Some(requested) => {
+                    // The requested window changed during the awaits above:
+                    // it no longer shows just the validated server window.
+                    // Forcing the tab there would separate it from its
+                    // server-window siblings, so leave it where the sync
+                    // put it.
+                    log::debug!(
+                        "moved tab stays in local window {local_win_id}: window {requested} \
+                         no longer shows only server window {:?}",
+                        validated_remote_window
+                    );
                     mux.window_containing_tab(local_tab_id)
                         .unwrap_or(local_win_id)
                 }
@@ -3650,6 +3668,19 @@ impl ClientDomain {
             pane_guard.capture_move_receipt(tab, local_win_id)
         })
         .map_err(anyhow::Error::new)?
+    }
+
+    /// Whether a moved tab may still be placed in `requested` after the
+    /// move's awaits. Without a validated server window (the plain
+    /// `Domain::move_pane_to_new_tab` path) it always may; with one, only
+    /// while `requested` still shows just that server window.
+    fn keeps_validated_placement(
+        &self,
+        requested: WindowId,
+        validated_remote_window: Option<WindowId>,
+    ) -> bool {
+        validated_remote_window
+            .is_none_or(|remote| self.local_window_shows_only_remote_window(requested, remote))
     }
 
     /// Whether `local_window_id` shows tabs of exactly one server window,
@@ -3726,7 +3757,15 @@ impl ClientDomain {
             _ => bail!("a move into an existing window needs its server window"),
         }
         let receipt = self
-            .move_pane_exact(mux, &inner, &pane_guard, local_window_id, remote_window_id, None)
+            .move_pane_exact(
+                mux,
+                &inner,
+                &pane_guard,
+                local_window_id,
+                remote_window_id,
+                None,
+                remote_window_id,
+            )
             .await?;
         let moved = mux
             .get_tab(receipt.tab_id())
@@ -5975,6 +6014,7 @@ impl Domain for ClientDomain {
             window_id,
             remote_window_id,
             workspace_for_new_window,
+            None,
         )
         .await
         .map(Some)
@@ -8843,6 +8883,37 @@ mod tests {
         .expect("a changed target must refuse, never redirect");
         let message = format!("{error:#}");
         assert!(message.contains("changed before the move ran"), "{}", message);
+    }
+
+    #[test]
+    fn a_validated_move_is_not_forced_into_a_target_that_changed_during_the_move() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_045);
+        let domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window = inner.remote_to_local_window(41).expect("window 41 maps");
+        assert!(domain.keeps_validated_placement(window, Some(41)));
+        assert!(domain.keeps_validated_placement(window, None), "plain path is unchanged");
+
+        // While the move's RPC and sync were awaited, the target came to
+        // show a tab of server window 42 as well.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_after_server_moved_pane_62(42),
+            None,
+        )
+        .expect("server move applies");
+        let tab_53 = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        mux.move_tab_between_windows(tab_53, window, None)
+            .expect("move tab 53 into the target window");
+        assert!(
+            !domain.keeps_validated_placement(window, Some(41)),
+            "the tab stays where the topology sync put it"
+        );
+        assert!(domain.keeps_validated_placement(window, None));
     }
 
     #[test]
