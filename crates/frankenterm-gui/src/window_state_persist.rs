@@ -1777,6 +1777,8 @@ struct CoordinatorPending {
     /// Overlays whose queued mutation the worker refused since the GUI last
     /// asked. The GUI then resets its revision bookkeeping to the store.
     rejected_overlay_ids: BTreeSet<LayoutWindowId>,
+    /// Overlay deletes the worker committed since the GUI last asked.
+    accepted_overlay_deletes: BTreeSet<LayoutWindowId>,
     #[cfg(test)]
     worker_commit_control: Option<TestWorkerCommitControl>,
 }
@@ -1921,6 +1923,11 @@ impl PersistenceWriter {
     /// The overlays whose mutation the worker refused since the last call.
     pub fn take_rejected_overlays(&self) -> BTreeSet<LayoutWindowId> {
         std::mem::take(&mut lock_pending(&self.shared.pending).rejected_overlay_ids)
+    }
+
+    /// The overlay deletes the worker committed since the last call.
+    pub fn take_accepted_overlay_deletes(&self) -> BTreeSet<LayoutWindowId> {
+        std::mem::take(&mut lock_pending(&self.shared.pending).accepted_overlay_deletes)
     }
 
     pub fn queue_overlay_delete(
@@ -2202,6 +2209,13 @@ fn acknowledge_committed_batch(
             pending
                 .rejected_overlay_ids
                 .extend(rejected_overlay_ids.iter().copied());
+        }
+        for window_id in &committed.accepted_overlay_ids {
+            if batch.overlay_mutations.get(window_id).is_some_and(|mutation| {
+                matches!(mutation.desired, DesiredOverlayState::Deleted { .. })
+            }) {
+                pending.accepted_overlay_deletes.insert(*window_id);
+            }
         }
         semantic_failure.map(|failure| pending.record_semantic_failure(failure))
     };
@@ -7357,6 +7371,15 @@ pub fn queue_layout_overlay_changes(
 pub fn take_rejected_layout_overlays() -> BTreeSet<LayoutWindowId> {
     match GLOBAL_WRITER.get() {
         Some(Ok(writer)) => writer.take_rejected_overlays(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// The overlay deletes the default worker committed since the last call.
+/// Empty when no writer was started.
+pub fn take_accepted_layout_overlay_deletes() -> BTreeSet<LayoutWindowId> {
+    match GLOBAL_WRITER.get() {
+        Some(Ok(writer)) => writer.take_accepted_overlay_deletes(),
         _ => BTreeSet::new(),
     }
 }
@@ -16104,6 +16127,12 @@ mod tests {
         let after = load_snapshot_at(&path).expect("load");
         assert!(after.overlay(emptied).is_none());
         assert!(after.tombstone(emptied).is_some());
+        assert_eq!(
+            writer.take_accepted_overlay_deletes(),
+            BTreeSet::from([emptied]),
+            "the GUI learns the delete was committed"
+        );
+        assert!(writer.take_rejected_overlays().is_empty());
         assert_eq!(after.overlay(receiver).map(|o| o.slots()), Some(&[slot][..]));
     }
 

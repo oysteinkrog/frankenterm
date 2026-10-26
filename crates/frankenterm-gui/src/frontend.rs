@@ -71,6 +71,7 @@ type LayoutDeletes = Vec<(LayoutWindowId, u64)>;
 /// store for those overlays. Revisions only advance for mutations the store
 /// accepted.
 fn sync_rejected_layout_overlays(lifecycle: &mut LayoutLifecycle) {
+    lifecycle.confirm_deletes(&crate::window_state_persist::take_accepted_layout_overlay_deletes());
     let mut rejected = crate::window_state_persist::take_rejected_layout_overlays();
     rejected.append(&mut lifecycle.unsynced_rejections);
     if rejected.is_empty() {
@@ -142,7 +143,7 @@ struct LayoutLifecycle {
 }
 
 /// A delete of a saved layout the user asked for (window closed or unified
-/// away), kept until the store has it.
+/// away), kept until the store confirms it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingDelete {
     /// The stored revision the delete is queued against.
@@ -151,8 +152,10 @@ struct PendingDelete {
     resend: bool,
 }
 
-/// At most this many explicit deletes are remembered for a retry.
-const MAX_PENDING_DELETES: usize = 4_096;
+/// Above this many unconfirmed deletes the GUI logs a warning. It never
+/// evicts one: an evicted delete that the store later refuses would bring
+/// a closed layout back.
+const PENDING_DELETES_WARN: usize = 4_096;
 
 struct LiveLayout {
     receipts: Vec<Arc<RemoteLayoutSnapshot>>,
@@ -432,16 +435,10 @@ impl LayoutLifecycle {
                 .overlays
                 .retain(|overlay| overlay.window_id() != window_id);
             self.restored.remove(&window_id);
-            if self.pending_deletes.len() >= MAX_PENDING_DELETES {
-                // Forget the oldest settled entry; refused ones stay.
-                if let Some(settled) = self
-                    .pending_deletes
-                    .iter()
-                    .find(|(_, pending)| !pending.resend)
-                    .map(|(id, _)| *id)
-                {
-                    self.pending_deletes.remove(&settled);
-                }
+            if self.pending_deletes.len() == PENDING_DELETES_WARN {
+                log::warn!(
+                    "{PENDING_DELETES_WARN} layout deletes wait for the store; keeping them all"
+                );
             }
             self.pending_deletes.insert(
                 window_id,
@@ -480,6 +477,17 @@ impl LayoutLifecycle {
             self.owned.insert(id, owned);
         }
         Ok(())
+    }
+
+    /// The store committed these deletes: stop tracking them. This is the
+    /// only way an entry leaves `pending_deletes` besides the store no
+    /// longer holding the overlay.
+    fn confirm_deletes(&mut self, accepted: &std::collections::BTreeSet<LayoutWindowId>) {
+        for id in accepted {
+            if self.pending_deletes.get(id).is_some_and(|pending| !pending.resend) {
+                self.pending_deletes.remove(id);
+            }
+        }
     }
 
     /// The store refused queued mutations of `rejected`. Reset their
@@ -2577,6 +2585,67 @@ mod tests {
             "L stays where the user put it"
         );
         other_window.cancel();
+    }
+
+    #[test]
+    fn unconfirmed_deletes_are_never_evicted() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow, PendingDelete};
+        let (mux, _activity, ids, tabs, mut live, startup, _temp) = remote_layout_fixture(&[1]);
+        let local = super::StableTabSlot::local(
+            super::StableLocalSessionId::from_bytes([5; 16]),
+            super::StableLocalTabId::from_bytes(*tabs[0].durable_id().as_bytes()),
+        );
+        live.slots.insert(tabs[0].tab_id(), local);
+        let closed_id = startup.new_layout_window_id().unwrap();
+        let closed =
+            MixedDomainLayoutOverlay::new(closed_id, "default", 2, vec![local], Some(local))
+                .unwrap();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
+        };
+        // The table already holds the warning limit of unconfirmed deletes.
+        let mut earlier = Vec::new();
+        for _ in 0..super::PENDING_DELETES_WARN {
+            let id = lifecycle.startup.new_layout_window_id().unwrap();
+            lifecycle.pending_deletes.insert(
+                id,
+                PendingDelete {
+                    revision: 1,
+                    resend: false,
+                },
+            );
+            earlier.push(id);
+        }
+        lifecycle.owned.insert(
+            ids[0],
+            OwnedLayoutWindow {
+                mux_identity: mux.get_window(ids[0]).unwrap().durable_id(),
+                overlay: closed,
+            },
+        );
+        lifecycle
+            .capture_and_retire(&mux, &live, &[ids[0]], |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(lifecycle.pending_deletes.len(), super::PENDING_DELETES_WARN + 1);
+        assert!(earlier.iter().all(|id| lifecycle.pending_deletes.contains_key(id)));
+
+        // A refusal of the oldest one is still retried at the stored revision.
+        let mut durable = lifecycle.startup.clone();
+        durable.overlays = vec![
+            MixedDomainLayoutOverlay::new(earlier[0], "default", 1, Vec::new(), None).unwrap(),
+        ];
+        lifecycle.resync_rejected_overlays(&std::collections::BTreeSet::from([earlier[0]]), &durable);
+        assert!(lifecycle.pending_deletes[&earlier[0]].resend);
+
+        // Only a confirmed delete leaves the table; a resend waits for its
+        // own confirmation.
+        lifecycle.confirm_deletes(&std::collections::BTreeSet::from([closed_id, earlier[0]]));
+        assert!(!lifecycle.pending_deletes.contains_key(&closed_id));
+        assert!(lifecycle.pending_deletes.contains_key(&earlier[0]));
     }
 
     #[test]
