@@ -3535,6 +3535,147 @@ impl ClientDomain {
         }
     }
 
+    /// Send `MovePaneToNewTab` for the exact pane and resolve the result.
+    /// `remote_window_id` is the server window to move into, `None` for a
+    /// new server window; `window_id` is the local window to place it in.
+    async fn move_pane_exact(
+        &self,
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+        pane_guard: &PaneOperationGuard,
+        window_id: Option<WindowId>,
+        remote_window_id: Option<WindowId>,
+        workspace_for_new_window: Option<String>,
+    ) -> anyhow::Result<MoveCommitReceipt> {
+        let remote_pane_id = Self::exact_remote_pane_id(pane_guard, inner, "move target")?;
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
+            .move_pane_to_new_tab(codec::MovePaneToNewTab {
+                pane_id: remote_pane_id,
+                window_id: remote_window_id,
+                workspace_for_new_window,
+            })
+            .await?;
+
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(inner), &rpc, None)
+            .await?
+        {
+            bail!("client attachment retired while moving pane");
+        }
+
+        rpc.commit_sync(RpcConsumerKind::MoveResolution, || {
+            let local_tab_id = inner.remote_to_local_tab_id(result.tab_id).ok_or_else(|| {
+                anyhow!("remote tab {} didn't resolve after resync", result.tab_id)
+            })?;
+
+            let local_win_id = inner
+                .remote_to_local_window(result.window_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "remote window {} didn't resolve after resync",
+                        result.window_id
+                    )
+                })?;
+
+            let tab = mux
+                .get_tab(local_tab_id)
+                .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
+            let local_win_id = match window_id {
+                Some(requested) => {
+                    place_tab_in_requested_window(mux, &tab, requested)?;
+                    mux.window_containing_tab(local_tab_id)
+                        .unwrap_or(local_win_id)
+                }
+                None => local_win_id,
+            };
+
+            pane_guard.capture_move_receipt(tab, local_win_id)
+        })
+        .map_err(anyhow::Error::new)?
+    }
+
+    /// Whether `local_window_id` shows tabs of exactly one server window,
+    /// `remote_window_id`, of this attachment and nothing else.
+    pub fn local_window_shows_only_remote_window(
+        &self,
+        local_window_id: WindowId,
+        remote_window_id: WindowId,
+    ) -> bool {
+        let Some(inner) = self.inner() else {
+            return false;
+        };
+        let Some(mux) = self.mux_owner.upgrade() else {
+            return false;
+        };
+        let Some(tabs) = mux
+            .get_window(local_window_id)
+            .map(|window| window.iter().cloned().collect::<Vec<Arc<Tab>>>())
+        else {
+            return false;
+        };
+        let all_ours = !tabs.is_empty()
+            && tabs.iter().all(|tab| {
+                let panes = tab.iter_all_panes();
+                !panes.is_empty()
+                    && panes.iter().all(|pane| {
+                        pane.downcast_ref::<ClientPane>()
+                            .is_some_and(|client_pane| client_pane.belongs_to_client(&inner))
+                    })
+            });
+        all_ours
+            && self
+                .remote_windows_shown_by_local_window(local_window_id)
+                .is_some_and(|windows| windows.len() == 1 && windows.contains(&remote_window_id))
+    }
+
+    /// Move `pane_id` on the server into `remote_window_id`, or into a new
+    /// server window when it is `None`, and place it in `local_window_id`.
+    ///
+    /// The GUI validated these ids before it scheduled the move. They are
+    /// checked again here, with no await between the check and the request,
+    /// so the server moves the pane into exactly the window that was
+    /// validated. The move is refused when the pane is no longer the whole
+    /// tab, or the local window no longer shows just that server window.
+    pub async fn move_pane_to_validated_window(
+        &self,
+        mux: &Arc<Mux>,
+        pane_id: PaneId,
+        local_window_id: Option<WindowId>,
+        remote_window_id: Option<WindowId>,
+    ) -> anyhow::Result<(Arc<Tab>, WindowId)> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        self.ensure_mux_owner(mux)?;
+        let pane_guard = mux
+            .capture_pane_operation(pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} is not a current registration"))?;
+        let (_domain_id, _window, tab_id) = pane_guard.exact_location_ids()?;
+        let tab = mux
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("the tab of pane {pane_id} is gone"))?;
+        ensure!(
+            tab.iter_all_panes().len() == 1,
+            "the tab changed before the move ran: it now has several panes"
+        );
+        match (local_window_id, remote_window_id) {
+            (None, None) => {}
+            (Some(local), Some(remote)) => ensure!(
+                self.local_window_shows_only_remote_window(local, remote),
+                "the target window changed before the move ran: it no longer shows \
+                 exactly the server window that was checked"
+            ),
+            _ => bail!("a move into an existing window needs its server window"),
+        }
+        let receipt = self
+            .move_pane_exact(mux, &inner, &pane_guard, local_window_id, remote_window_id, None)
+            .await?;
+        let moved = mux
+            .get_tab(receipt.tab_id())
+            .ok_or_else(|| anyhow!("moved tab {} is gone", receipt.tab_id()))?;
+        Ok((moved, receipt.window_id()))
+    }
+
     /// The server windows whose tabs `local_window_id` shows, from the latest
     /// topology snapshot. Only tabs whose panes all belong to this attachment
     /// count. `None` when the domain is detached or one of those tabs has no
@@ -5762,8 +5903,6 @@ impl Domain for ClientDomain {
             pane_guard.belongs_to(mux),
             "move target belongs to another mux registration"
         );
-        let remote_pane_id = Self::exact_remote_pane_id(pane_guard, &inner, "move target")?;
-
         let remote_window_id = window_id
             .and_then(|local_window| inner.remote_window_for_local_window(mux, local_window));
         // Asking the server for a new window when the caller named an existing
@@ -5771,51 +5910,16 @@ impl Domain for ClientDomain {
         if let (Some(local_window), None) = (window_id, remote_window_id) {
             bail!("local window {local_window} shows no remote window of this domain");
         }
-
-        let rpc = inner.client.rpc_scope();
-        let result = rpc
-            .move_pane_to_new_tab(codec::MovePaneToNewTab {
-                pane_id: remote_pane_id,
-                window_id: remote_window_id,
-                workspace_for_new_window,
-            })
-            .await?;
-
-        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), &rpc, None)
-            .await?
-        {
-            bail!("client attachment retired while moving pane");
-        }
-
-        rpc.commit_sync(RpcConsumerKind::MoveResolution, || {
-            let local_tab_id = inner.remote_to_local_tab_id(result.tab_id).ok_or_else(|| {
-                anyhow!("remote tab {} didn't resolve after resync", result.tab_id)
-            })?;
-
-            let local_win_id = inner
-                .remote_to_local_window(result.window_id)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "remote window {} didn't resolve after resync",
-                        result.window_id
-                    )
-                })?;
-
-            let tab = mux
-                .get_tab(local_tab_id)
-                .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
-            let local_win_id = match window_id {
-                Some(requested) => {
-                    place_tab_in_requested_window(mux, &tab, requested)?;
-                    mux.window_containing_tab(local_tab_id)
-                        .unwrap_or(local_win_id)
-                }
-                None => local_win_id,
-            };
-
-            pane_guard.capture_move_receipt(tab, local_win_id).map(Some)
-        })
-        .map_err(anyhow::Error::new)?
+        self.move_pane_exact(
+            mux,
+            &inner,
+            pane_guard,
+            window_id,
+            remote_window_id,
+            workspace_for_new_window,
+        )
+        .await
+        .map(Some)
     }
 
     async fn spawn(
@@ -8580,6 +8684,44 @@ mod tests {
             "the whole group follows the server's workspace"
         );
         assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+    }
+
+    #[test]
+    fn a_validated_server_move_is_refused_when_the_target_window_changed() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_042);
+        let domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window = inner.remote_to_local_window(41).expect("window 41 maps");
+        assert!(domain.local_window_shows_only_remote_window(window, 41));
+        assert!(!domain.local_window_shows_only_remote_window(window, 42));
+
+        // After validation, the target window gains a tab of server window 42.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_after_server_moved_pane_62(42),
+            None,
+        )
+        .expect("server move applies");
+        let tab_53 = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        mux.move_tab_between_windows(tab_53, window, None)
+            .expect("move tab 53 into the target window");
+        assert!(!domain.local_window_shows_only_remote_window(window, 41));
+
+        let pane_61 = inner.remote_to_local_pane_id(&mux, 61).expect("pane 61");
+        let error = asupersync_block_on(domain.move_pane_to_validated_window(
+            &mux,
+            pane_61,
+            Some(window),
+            Some(41),
+        ))
+        .err()
+        .expect("a changed target must refuse, never redirect");
+        let message = format!("{error:#}");
+        assert!(message.contains("changed before the move ran"), "{}", message);
     }
 
     #[test]

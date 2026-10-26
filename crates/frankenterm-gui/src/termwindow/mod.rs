@@ -8017,6 +8017,45 @@ impl TermWindow {
         }
     }
 
+    /// Carry out a validated server move. The scheduled step runs later than
+    /// the validation, so check the tab and the target again here, and let
+    /// the domain check once more right before it sends the request. A move
+    /// whose route changed in between is refused, never redirected.
+    async fn move_tab_on_server(
+        mux: &Arc<Mux>,
+        domain: DomainId,
+        pane_id: PaneId,
+        target: Option<MuxWindowId>,
+        remote_window: Option<usize>,
+    ) -> anyhow::Result<(Arc<Tab>, MuxWindowId)> {
+        let changed = || anyhow!("the tab or the target window changed before the move ran");
+        let (_, _, tab_id) = mux.resolve_pane_id(pane_id).ok_or_else(changed)?;
+        let tab = mux.get_tab(tab_id).ok_or_else(changed)?;
+        let source = Self::tab_move_source(mux, &tab);
+        drop(tab);
+        if !matches!(source, TabMoveSource::Remote { domain: now, .. } if now == domain) {
+            return Err(changed());
+        }
+        let target_facts = match target {
+            None => TabMoveTarget::NewWindow,
+            Some(window_id) => {
+                TabMoveTarget::Window(Self::tab_move_target_window(mux, domain, window_id))
+            }
+        };
+        if route_tab_move(source, &target_facts) != Ok(TabMoveRoute::Server { remote_window }) {
+            return Err(changed());
+        }
+        let domain = mux
+            .get_domain(domain)
+            .ok_or_else(|| anyhow!("the tab's domain is gone"))?;
+        let client = domain
+            .downcast_ref::<frankenterm_client::domain::ClientDomain>()
+            .ok_or_else(|| anyhow!("the tab's domain is not a mux server domain"))?;
+        client
+            .move_pane_to_validated_window(mux, pane_id, target, remote_window)
+            .await
+    }
+
     /// Move the active tab into `target`, or into a new window when `target`
     /// is `None`, then focus the window it lands in. The mux can only move a
     /// pane, so a tab with several panes moves just its active pane.
@@ -8075,7 +8114,23 @@ impl TermWindow {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                 reservation
                     .spawn_local(async move {
-                        match mux.move_pane_to_new_tab(pane_id, target, None).await {
+                        let moved = match (route, source) {
+                            (
+                                TabMoveRoute::Server { remote_window },
+                                TabMoveSource::Remote { domain, .. },
+                            ) => {
+                                Self::move_tab_on_server(
+                                    &mux,
+                                    domain,
+                                    pane_id,
+                                    target,
+                                    remote_window,
+                                )
+                                .await
+                            }
+                            _ => mux.move_pane_to_new_tab(pane_id, target, None).await,
+                        };
+                        match moved {
                             Ok((tab, window_id)) => {
                                 if let Some(title) = &carried_title {
                                     tab.set_title(title);
