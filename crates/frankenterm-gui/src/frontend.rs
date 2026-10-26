@@ -71,19 +71,18 @@ type LayoutDeletes = Vec<(LayoutWindowId, u64)>;
 /// store for those overlays. Revisions only advance for mutations the store
 /// accepted.
 fn sync_rejected_layout_overlays(lifecycle: &mut LayoutLifecycle) {
-    let rejected = crate::window_state_persist::take_rejected_layout_overlays();
+    let mut rejected = crate::window_state_persist::take_rejected_layout_overlays();
+    rejected.append(&mut lifecycle.unsynced_rejections);
     if rejected.is_empty() {
         return;
     }
     match crate::window_state_persist::load_layout_state() {
         Ok(durable) => lifecycle.resync_rejected_overlays(&rejected, &durable),
         Err(error) => {
+            // Keep the refusals and try the reload on the next pass, rather
+            // than drop ownership and leave stale claims behind.
             log::warn!("could not reload the saved layout after a refused update: {error:?}");
-            // Forget the refused overlays rather than build on revisions
-            // that never landed.
-            lifecycle
-                .owned
-                .retain(|_, owned| !rejected.contains(&owned.overlay.window_id()));
+            lifecycle.unsynced_rejections = rejected;
         }
     }
 }
@@ -134,7 +133,26 @@ struct LayoutLifecycle {
     startup: LayoutStateSnapshot,
     owned: HashMap<MuxWindowId, OwnedLayoutWindow>,
     restored: std::collections::BTreeSet<LayoutWindowId>,
+    /// Deletes queued for windows the user closed or unified away, by the
+    /// revision they were queued at. Kept so a refused delete is retried
+    /// instead of lost.
+    pending_deletes: BTreeMap<LayoutWindowId, PendingDelete>,
+    /// Refusals whose stored state could not be reloaded yet.
+    unsynced_rejections: std::collections::BTreeSet<LayoutWindowId>,
 }
+
+/// A delete of a saved layout the user asked for (window closed or unified
+/// away), kept until the store has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingDelete {
+    /// The stored revision the delete is queued against.
+    revision: u64,
+    /// The store refused the last attempt: send it again.
+    resend: bool,
+}
+
+/// At most this many explicit deletes are remembered for a retry.
+const MAX_PENDING_DELETES: usize = 4_096;
 
 struct LiveLayout {
     receipts: Vec<Arc<RemoteLayoutSnapshot>>,
@@ -241,6 +259,12 @@ impl LayoutLifecycle {
         let mut next_owned = Vec::new();
         let mut deletes = Vec::new();
         let mut retired = Vec::new();
+        // Explicit deletes the store refused go again, at the stored revision.
+        for (&window_id, pending) in &self.pending_deletes {
+            if pending.resend {
+                deletes.push((window_id, pending.revision));
+            }
+        }
         for &id in retiring {
             let Some(owned) = self.owned.get(&id) else {
                 continue;
@@ -252,7 +276,12 @@ impl LayoutLifecycle {
             {
                 continue;
             }
-            deletes.push((owned.overlay.window_id(), owned.overlay.local_revision()));
+            if !deletes
+                .iter()
+                .any(|(window_id, _)| *window_id == owned.overlay.window_id())
+            {
+                deletes.push((owned.overlay.window_id(), owned.overlay.local_revision()));
+            }
             retired.push(id);
         }
         for id in mux.iter_windows_bounded(4_096)? {
@@ -398,11 +427,29 @@ impl LayoutLifecycle {
         for id in retired {
             self.owned.remove(&id);
         }
-        for (window_id, _) in deletes {
+        for (window_id, revision) in deletes {
             self.startup
                 .overlays
                 .retain(|overlay| overlay.window_id() != window_id);
             self.restored.remove(&window_id);
+            if self.pending_deletes.len() >= MAX_PENDING_DELETES {
+                // Forget the oldest settled entry; refused ones stay.
+                if let Some(settled) = self
+                    .pending_deletes
+                    .iter()
+                    .find(|(_, pending)| !pending.resend)
+                    .map(|(id, _)| *id)
+                {
+                    self.pending_deletes.remove(&settled);
+                }
+            }
+            self.pending_deletes.insert(
+                window_id,
+                PendingDelete {
+                    revision,
+                    resend: false,
+                },
+            );
         }
         for (_, released) in donors {
             for owned in self.owned.values_mut() {
@@ -436,9 +483,17 @@ impl LayoutLifecycle {
     }
 
     /// The store refused queued mutations of `rejected`. Reset their
-    /// bookkeeping to what the store holds, so the next capture builds on the
-    /// committed revision instead of one that never landed. An overlay the
-    /// store does not hold is forgotten, and its window gets a new one.
+    /// bookkeeping to the stored revision so the next capture retries the
+    /// same intent against it:
+    ///
+    /// - An owned overlay keeps its ownership at the stored revision; the
+    ///   next capture recomputes its update or slot release. One the store
+    ///   never held is forgotten, and its window gets a new one.
+    /// - A startup overlay is replaced in place by the stored one. A refusal
+    ///   never adds an overlay to the startup list, so it can never turn into
+    ///   a restore that moves tabs back.
+    /// - An explicit delete is sent again at the stored revision, or dropped
+    ///   when the store no longer holds the overlay.
     fn resync_rejected_overlays(
         &mut self,
         rejected: &std::collections::BTreeSet<LayoutWindowId>,
@@ -457,12 +512,35 @@ impl LayoutLifecycle {
                 None => false,
             }
         });
-        self.startup
-            .overlays
-            .retain(|overlay| !rejected.contains(&overlay.window_id()));
-        for &id in rejected {
-            if let Some(stored) = durable.overlay(id) {
-                self.startup.overlays.push(stored.clone());
+        self.startup.overlays.retain_mut(|overlay| {
+            if !rejected.contains(&overlay.window_id()) {
+                return true;
+            }
+            match durable.overlay(overlay.window_id()) {
+                Some(stored) => {
+                    *overlay = stored.clone();
+                    true
+                }
+                None => false,
+            }
+        });
+        for id in rejected {
+            if !self.pending_deletes.contains_key(id) {
+                continue;
+            }
+            match durable.overlay(*id) {
+                Some(stored) => {
+                    self.pending_deletes.insert(
+                        *id,
+                        PendingDelete {
+                            revision: stored.local_revision(),
+                            resend: true,
+                        },
+                    );
+                }
+                None => {
+                    self.pending_deletes.remove(id);
+                }
             }
         }
     }
@@ -992,7 +1070,9 @@ impl GuiFrontEnd {
                         startup,
                         owned: HashMap::new(),
                         restored: Default::default(),
-                                }),
+                        pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
+                    }),
             ),
             applying_layout: Cell::new(false),
         });
@@ -2009,6 +2089,8 @@ mod tests {
             startup,
             owned: HashMap::new(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         lifecycle.restore(&mux, &live).unwrap();
         let expected = [
@@ -2150,6 +2232,8 @@ mod tests {
             startup,
             owned: Default::default(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         lifecycle.restore(&mux, &live).unwrap();
         assert_eq!(mux.iter_windows(), ids);
@@ -2215,6 +2299,8 @@ mod tests {
             startup,
             owned: Default::default(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         lifecycle.restore(&mux, &live).unwrap();
         let mut expected_windows = vec![ids[0], local_window_id];
@@ -2249,6 +2335,8 @@ mod tests {
             startup,
             owned: Default::default(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         lifecycle.restored.insert(overlay_id);
         lifecycle.owned.insert(
@@ -2325,6 +2413,8 @@ mod tests {
             startup,
             owned: Default::default(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         for overlay in [&overlay_a, &overlay_b, &inert] {
             lifecycle.restored.insert(overlay.window_id());
@@ -2396,6 +2486,8 @@ mod tests {
             startup,
             owned: Default::default(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         lifecycle.owned.insert(
             ids[0],
@@ -2420,6 +2512,65 @@ mod tests {
         assert_eq!(lifecycle.startup.overlays, vec![stored]);
     }
 
+    #[test]
+    fn a_refused_explicit_delete_is_sent_again_and_never_becomes_a_restore() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow};
+        use std::sync::Mutex;
+        let (mux, _activity, ids, tabs, mut live, startup, _temp) = remote_layout_fixture(&[1]);
+        let local = super::StableTabSlot::local(
+            super::StableLocalSessionId::from_bytes([5; 16]),
+            super::StableLocalTabId::from_bytes(*tabs[0].durable_id().as_bytes()),
+        );
+        live.slots.insert(tabs[0].tab_id(), local);
+        let closed_id = startup.new_layout_window_id().unwrap();
+        let closed =
+            MixedDomainLayoutOverlay::new(closed_id, "default", 2, vec![local], Some(local))
+                .unwrap();
+        let mut durable = startup.clone();
+        durable.overlays = vec![closed.clone()];
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
+        };
+        lifecycle.restored.insert(closed_id);
+        lifecycle.owned.insert(
+            ids[0],
+            OwnedLayoutWindow {
+                mux_identity: mux.get_window(ids[0]).unwrap().durable_id(),
+                overlay: closed.clone(),
+            },
+        );
+        // The user closes the window: its delete is queued.
+        let queued = Mutex::new(Vec::new());
+        lifecycle
+            .capture_and_retire(&mux, &live, &[ids[0]], |_, deletes| {
+                queued.lock().unwrap().push(deletes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(queued.lock().unwrap().last(), Some(&vec![(closed_id, 2)]));
+        // The store refuses it at a newer stored revision.
+        let stored = MixedDomainLayoutOverlay::new(closed_id, "default", 3, vec![local], Some(local))
+            .unwrap();
+        durable.overlays = vec![stored];
+        lifecycle.resync_rejected_overlays(&std::collections::BTreeSet::from([closed_id]), &durable);
+        assert!(
+            lifecycle.startup.overlay(closed_id).is_none(),
+            "a refused delete never becomes a startup restore"
+        );
+        // The next pass sends the same delete against the stored revision.
+        lifecycle
+            .capture_and_retire(&mux, &live, &[], |_, deletes| {
+                queued.lock().unwrap().push(deletes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(queued.lock().unwrap().last(), Some(&vec![(closed_id, 3)]));
+        assert!(!lifecycle.pending_deletes[&closed_id].resend);
+    }
 
     #[test]
     fn retiring_a_window_deletes_its_overlay_in_one_batch_with_the_receiver() {
@@ -2459,6 +2610,8 @@ mod tests {
             startup,
             owned: Default::default(),
             restored: Default::default(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         for (&id, overlay) in ids.iter().zip(&overlays) {
             lifecycle.restored.insert(overlay.window_id());
@@ -2493,6 +2646,8 @@ mod tests {
                 })
                 .collect(),
             restored: lifecycle.restored.clone(),
+            pending_deletes: Default::default(),
+            unsynced_rejections: Default::default(),
         };
         plain
             .capture_and_retire(&mux, &live, &[], |_, deletes| {
