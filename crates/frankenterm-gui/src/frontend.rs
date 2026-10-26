@@ -88,6 +88,39 @@ fn sync_rejected_layout_overlays(lifecycle: &mut LayoutLifecycle) {
     }
 }
 
+/// `donor` without the slots in `claimed`, at the next revision, or `None`
+/// when it lists none of them. The result may be empty: an emptied overlay
+/// is kept, never deleted here.
+fn release_claimed_slots(
+    donor: &MixedDomainLayoutOverlay,
+    claimed: &std::collections::HashSet<crate::window_state_persist::StableTabIdentity>,
+) -> anyhow::Result<Option<MixedDomainLayoutOverlay>> {
+    let kept: Vec<_> = donor
+        .slots()
+        .iter()
+        .copied()
+        .filter(|slot| !claimed.contains(&slot.identity()))
+        .collect();
+    if kept.len() == donor.slots().len() {
+        return Ok(None);
+    }
+    let active = donor
+        .active()
+        .filter(|active| kept.contains(active))
+        .or_else(|| kept.first().copied());
+    let revision = donor
+        .local_revision()
+        .checked_add(1)
+        .context("layout revision exhausted")?;
+    Ok(Some(MixedDomainLayoutOverlay::new(
+        donor.window_id(),
+        donor.workspace(),
+        revision,
+        kept,
+        active,
+    )?))
+}
+
 fn queue_layout_changes(updates: LayoutUpdates, deletes: LayoutDeletes) -> anyhow::Result<()> {
     crate::window_state_persist::queue_layout_overlay_changes(updates, deletes).map_err(Into::into)
 }
@@ -268,13 +301,11 @@ impl LayoutLifecycle {
                     continue;
                 }
             } else if slots.iter().all(|slot| slot.remote_binding().is_some()) {
-                // The overlay no longer describes a window with local tabs.
-                // Delete it in this batch, so its stale claims on tabs that
-                // moved elsewhere cannot block the windows that took them.
-                if let Some(old) = old {
-                    deletes.push((old.overlay.window_id(), old.overlay.local_revision()));
-                    retired.push(id);
-                }
+                // Remote grouping belongs to the server, so this window's
+                // layout is not updated. An overlay it already owns is kept:
+                // a saved layout is only deleted when the user closes the
+                // window or runs Unify. Its claims on tabs that moved away
+                // are released slot by slot below.
                 continue;
             }
             let active = order
@@ -321,45 +352,45 @@ impl LayoutLifecycle {
                 },
             ));
         }
-        // An update may claim a tab that an inert overlay still lists: one
-        // whose window is gone, or a restored startup overlay nobody owns.
-        // The store refuses such a claim on its own, so release the old
-        // claim in the same batch. Overlays nothing claims are left alone,
-        // which keeps every layout across quit and disconnect.
+        // An update may claim a tab that another saved overlay still lists:
+        // an owned overlay this pass does not update (its window is gone or
+        // shows only remote tabs), or a startup overlay nobody owns. The
+        // store refuses such a claim on its own, so the donor gives up just
+        // the claimed slots, as an update in the same batch. Its other slots
+        // stay, and it is kept even when empty: only an explicit close or
+        // Unify deletes a saved layout.
         let claimed: std::collections::HashSet<_> = updates
             .iter()
             .flat_map(|(_, overlay)| overlay.slots().iter().map(|slot| slot.identity()))
             .collect();
-        let claims_updated_tab = |overlay: &MixedDomainLayoutOverlay| {
-            overlay
-                .slots()
+        let mut donors = Vec::new();
+        if !claimed.is_empty() {
+            let updated: std::collections::HashSet<_> = updates
                 .iter()
-                .any(|slot| claimed.contains(&slot.identity()))
-        };
-        let mut released = Vec::new();
-        for (&id, owned) in &self.owned {
-            let window_is_live = mux
-                .get_window(id)
-                .is_some_and(|window| window.durable_id() == owned.mux_identity);
-            if !window_is_live && !retired.contains(&id) && claims_updated_tab(&owned.overlay) {
-                released.push((owned.overlay.window_id(), owned.overlay.local_revision()));
-                retired.push(id);
+                .map(|(_, overlay)| overlay.window_id())
+                .collect();
+            let deleted: std::collections::HashSet<_> =
+                deletes.iter().map(|(window_id, _)| *window_id).collect();
+            let candidates = self
+                .owned
+                .values()
+                .map(|owned| &owned.overlay)
+                .chain(self.startup.overlays.iter().filter(|overlay| {
+                    !self
+                        .owned
+                        .values()
+                        .any(|owned| owned.overlay.window_id() == overlay.window_id())
+                }));
+            for donor in candidates {
+                if updated.contains(&donor.window_id()) || deleted.contains(&donor.window_id()) {
+                    continue;
+                }
+                if let Some(released) = release_claimed_slots(donor, &claimed)? {
+                    donors.push((Some(donor.local_revision()), released));
+                }
             }
         }
-        for overlay in &self.startup.overlays {
-            let inert = self.restored.contains(&overlay.window_id())
-                && !self
-                    .owned
-                    .values()
-                    .any(|owned| owned.overlay.window_id() == overlay.window_id());
-            if inert
-                && claims_updated_tab(overlay)
-                && !deletes.iter().any(|(id, _)| *id == overlay.window_id())
-            {
-                released.push((overlay.window_id(), overlay.local_revision()));
-            }
-        }
-        deletes.extend(released);
+        updates.extend(donors.iter().cloned());
         if updates.is_empty() && deletes.is_empty() {
             return Ok(());
         }
@@ -372,6 +403,21 @@ impl LayoutLifecycle {
                 .overlays
                 .retain(|overlay| overlay.window_id() != window_id);
             self.restored.remove(&window_id);
+        }
+        for (_, released) in donors {
+            for owned in self.owned.values_mut() {
+                if owned.overlay.window_id() == released.window_id() {
+                    owned.overlay = released.clone();
+                }
+            }
+            if let Some(startup) = self
+                .startup
+                .overlays
+                .iter_mut()
+                .find(|overlay| overlay.window_id() == released.window_id())
+            {
+                *startup = released;
+            }
         }
         for (id, owned) in next_owned {
             // A local edit supersedes the startup placement, including edits
@@ -946,7 +992,7 @@ impl GuiFrontEnd {
                         startup,
                         owned: HashMap::new(),
                         restored: Default::default(),
-                    }),
+                                }),
             ),
             applying_layout: Cell::new(false),
         });
@@ -2190,7 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_drops_an_overlay_whose_window_now_holds_only_remote_tabs() {
+    fn capture_keeps_but_stops_updating_an_overlay_whose_window_holds_only_remote_tabs() {
         use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow};
         let (mux, _activity, ids, tabs, live, startup, _temp) = remote_layout_fixture(&[2]);
         let slots = vec![live.slots[&tabs[0].tab_id()], live.slots[&tabs[1].tab_id()]];
@@ -2212,21 +2258,19 @@ mod tests {
                 overlay,
             },
         );
-        // The overlay is deleted at its owned revision, so its claims go
-        // with it, and nothing else is written.
+        // Only an explicit close or Unify deletes a saved layout: nothing is
+        // written, and the overlay stays owned so it can release claims.
         lifecycle
-            .capture_and_retire(&mux, &live, &[], |updates, deletes| {
-                assert!(updates.is_empty());
-                assert_eq!(deletes, vec![(overlay_id, 4)]);
-                Ok(())
+            .capture_and_retire(&mux, &live, &[], |_, _| -> anyhow::Result<()> {
+                panic!("a window with only remote tabs writes nothing")
             })
             .unwrap();
-        assert!(lifecycle.owned.is_empty());
-        assert!(lifecycle.startup.overlay(overlay_id).is_none());
+        assert_eq!(lifecycle.owned[&ids[0]].overlay.window_id(), overlay_id);
+        assert_eq!(lifecycle.owned[&ids[0]].overlay.local_revision(), 4);
     }
 
     #[test]
-    fn a_window_left_with_only_remote_tabs_releases_its_claims_in_the_receivers_batch() {
+    fn claiming_a_tab_releases_only_that_slot_from_donor_overlays_in_the_same_batch() {
         use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow};
         use std::sync::{Arc, Mutex};
         // Window A shows local tab L and remote tab R. Window B shows local
@@ -2304,18 +2348,30 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (updates, mut deletes) = recorded.into_inner().unwrap().unwrap();
-        deletes.sort();
-        let mut expected = vec![(overlay_a.window_id(), 3), (inert.window_id(), 7)];
-        expected.sort();
-        assert_eq!(deletes, expected, "stale claims on L go in the same batch");
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].0, Some(1));
-        assert_eq!(updates[0].1.window_id(), overlay_b.window_id());
-        assert!(updates[0].1.slots().contains(&slot_l));
-        assert!(!lifecycle.owned.contains_key(&window_a));
-        assert!(lifecycle.startup.overlay(overlay_a.window_id()).is_none());
-        assert!(lifecycle.startup.overlay(inert.window_id()).is_none());
+        let (updates, deletes) = recorded.into_inner().unwrap().unwrap();
+        assert!(deletes.is_empty(), "claiming a tab never deletes a layout");
+        let update = |window_id| {
+            updates
+                .iter()
+                .find(|(_, overlay)| overlay.window_id() == window_id)
+                .cloned()
+                .expect("an update for the window")
+        };
+        assert_eq!(updates.len(), 3);
+        let (base, receiver) = update(overlay_b.window_id());
+        assert_eq!(base, Some(1));
+        assert!(receiver.slots().contains(&slot_l));
+        // The donors give up only L, at their next revision, in the same
+        // batch; their other slots stay, and an emptied one is kept.
+        let (base, donor_a) = update(overlay_a.window_id());
+        assert_eq!(base, Some(3));
+        assert_eq!(donor_a.slots(), &[slot_r][..]);
+        assert_eq!(donor_a.active(), Some(slot_r));
+        let (base, donor_inert) = update(inert.window_id());
+        assert_eq!(base, Some(7));
+        assert!(donor_inert.slots().is_empty());
+        assert_eq!(lifecycle.owned[&window_a].overlay, donor_a);
+        assert_eq!(lifecycle.startup.overlay(inert.window_id()), Some(&donor_inert));
         window_b_builder.cancel();
     }
 
@@ -2363,6 +2419,7 @@ mod tests {
         assert!(!lifecycle.owned.contains_key(&usize::MAX));
         assert_eq!(lifecycle.startup.overlays, vec![stored]);
     }
+
 
     #[test]
     fn retiring_a_window_deletes_its_overlay_in_one_batch_with_the_receiver() {
