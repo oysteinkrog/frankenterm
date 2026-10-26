@@ -75,9 +75,12 @@ pub struct LauncherArgs {
     active_workspace: String,
     workspaces: Vec<LauncherWorkspaceEntry>,
     move_targets: Vec<LauncherWindowEntry>,
-    /// Panes in the active tab; a tab with more than one moves only its
-    /// active pane, so the labels say "pane" instead of "tab".
+    /// Panes in the active tab; a local tab with more than one moves only
+    /// its active pane, so the labels say "pane" instead of "tab".
     active_tab_pane_count: usize,
+    /// Whether the active tab comes from a mux server. Such a tab moves as a
+    /// whole on the server, and a split one cannot move at all.
+    active_tab_is_remote: bool,
     help_text: String,
     fuzzy_help_text: String,
     alphabet: String,
@@ -208,6 +211,11 @@ impl LauncherArgs {
             } else {
                 (vec![], 1)
             };
+        let active_tab_is_remote = mux.get_domain(domain_id_of_current_tab).is_some_and(|domain| {
+            domain
+                .downcast_ref::<frankenterm_client::domain::ClientDomain>()
+                .is_some()
+        });
 
         let domains = if flags.contains(LauncherFlags::DOMAINS) {
             let mut domains = mux.iter_domains();
@@ -257,6 +265,7 @@ impl LauncherArgs {
             active_workspace,
             move_targets,
             active_tab_pane_count,
+            active_tab_is_remote,
             help_text: help_text.to_string(),
             fuzzy_help_text: fuzzy_help_text.to_string(),
             alphabet: alphabet.to_string(),
@@ -336,17 +345,25 @@ fn build_move_tab_entries(args: &LauncherArgs) -> Vec<Entry> {
     if !args.flags.contains(LauncherFlags::MOVE_TAB_TO_WINDOW) {
         return vec![];
     }
-    let what = if args.active_tab_pane_count > 1 {
+    let split = args.active_tab_pane_count > 1;
+    let what = if split && !args.active_tab_is_remote {
         "active pane"
     } else {
         "tab"
+    };
+    // A split tab from a mux server cannot move: the server moves one pane
+    // at a time, which would split the tab. Say so before the user picks.
+    let refused = if split && args.active_tab_is_remote {
+        " (not possible: split mux server tab)"
+    } else {
+        ""
     };
     let mut entries: Vec<Entry> = args
         .move_targets
         .iter()
         .map(|target| Entry {
             label: format!(
-                "Move {what} to window {}: {} ({})",
+                "Move {what} to window {}: {} ({}){refused}",
                 target.window_id,
                 target.title,
                 count_label(target.tab_count, "tab", "tabs")
@@ -355,7 +372,7 @@ fn build_move_tab_entries(args: &LauncherArgs) -> Vec<Entry> {
         })
         .collect();
     entries.push(Entry {
-        label: format!("Move {what} to a new window"),
+        label: format!("Move {what} to a new window{refused}"),
         action: KeyAssignment::MoveTabToNewWindow,
     });
     entries
@@ -933,6 +950,7 @@ mod tests {
                 },
             ],
             active_tab_pane_count: 1,
+            active_tab_is_remote: false,
             help_text: String::new(),
             fuzzy_help_text: String::new(),
             alphabet: String::new(),
@@ -1007,6 +1025,27 @@ mod tests {
             "Move active pane to window 7: cargo build (2 tabs)"
         );
         assert_eq!(entries[2].label, "Move active pane to a new window");
+    }
+
+    #[test]
+    fn move_tab_rows_for_a_split_mux_server_tab_say_it_cannot_move() {
+        let mut args = sample_args(LauncherFlags::MOVE_TAB_TO_WINDOW);
+        args.active_tab_pane_count = 3;
+        args.active_tab_is_remote = true;
+        let entries = build_move_tab_entries(&args);
+
+        assert_eq!(
+            entries[0].label,
+            "Move tab to window 7: cargo build (2 tabs) (not possible: split mux server tab)"
+        );
+        assert_eq!(
+            entries[2].label,
+            "Move tab to a new window (not possible: split mux server tab)"
+        );
+
+        args.active_tab_pane_count = 1;
+        let entries = build_move_tab_entries(&args);
+        assert_eq!(entries[2].label, "Move tab to a new window");
     }
 
     #[test]
