@@ -2883,10 +2883,10 @@ async fn resync_for_window_order(mux: &Arc<Mux>, domain_id: DomainId, inner: &Ar
         return false;
     }
     let domain = mux.get_domain(domain_id);
-    if let Some(client) = domain
+    let client = domain
         .as_ref()
-        .and_then(|domain| domain.downcast_ref::<ClientDomain>())
-    {
+        .and_then(|domain| domain.downcast_ref::<ClientDomain>());
+    if let Some(client) = client {
         let rpc = inner.client.rpc_scope();
         if let Err(error) = client
             .resync_if_current(Arc::clone(mux), Arc::clone(inner), &rpc)
@@ -2896,7 +2896,33 @@ async fn resync_for_window_order(mux: &Arc<Mux>, domain_id: DomainId, inner: &Ar
         }
     }
     inner.order_resync_in_flight.store(false, Ordering::Release);
+    drain_windows_waiting_on_order_resync(mux, inner, client);
     true
+}
+
+/// Re-run the order commits deferred behind an order-triggered resync,
+/// whether it succeeded or failed. A successful sync has already drained
+/// them, so this only acts after a failure: each window then retries
+/// against its own bounded budget, or gives up and logs.
+fn drain_windows_waiting_on_order_resync(
+    mux: &Mux,
+    inner: &ClientInner,
+    client: Option<&ClientDomain>,
+) {
+    for local_window_id in inner.take_deferred_window_orders() {
+        match client {
+            Some(client) if mux.get_window(local_window_id).is_some() => {
+                client.commit_local_window_order(local_window_id);
+            }
+            Some(_) => inner.clear_order_resync_requests(local_window_id),
+            None => {
+                log::warn!(
+                    "tab order for window {local_window_id} was not committed: its domain is gone"
+                );
+                inner.clear_order_resync_requests(local_window_id);
+            }
+        }
+    }
 }
 
 /// Whether a commit named a remote tab the server no longer knows. A tab
@@ -2992,7 +3018,8 @@ async fn run_window_order_commits(
                                 continue;
                             }
                             // Another resync is running and re-runs deferred
-                            // windows when it finishes; this task ends first.
+                            // windows when it finishes, success or failure;
+                            // this task ends first.
                             inner.defer_window_order(local_window_id);
                             return;
                         }
@@ -6847,6 +6874,34 @@ mod tests {
         inner.defer_window_order(18);
         assert_eq!(inner.take_deferred_window_orders(), vec![17, 18]);
         assert!(inner.take_deferred_window_orders().is_empty());
+    }
+
+    #[test]
+    fn windows_deferred_behind_a_failed_order_resync_are_still_rerun() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_043);
+        let domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window = inner.remote_to_local_window(41).expect("window maps");
+        let gone = usize::MAX - 1;
+        inner.defer_window_order(window);
+        inner.defer_window_order(gone);
+        assert_eq!(inner.note_order_resync_request(gone), 0);
+
+        // The resync failed: the waiting windows are re-run anyway, and a
+        // window that no longer exists gives up and frees its count.
+        drain_windows_waiting_on_order_resync(&mux, &inner, Some(&domain));
+        assert!(inner.take_deferred_window_orders().is_empty());
+        assert!(!lock_or_recover(&inner.order_resync_requests, "test").contains_key(&gone));
+
+        // With the domain gone, every waiting window gives up.
+        inner.defer_window_order(window);
+        assert_eq!(inner.note_order_resync_request(window), 0);
+        drain_windows_waiting_on_order_resync(&mux, &inner, None);
+        assert!(inner.take_deferred_window_orders().is_empty());
+        assert!(!lock_or_recover(&inner.order_resync_requests, "test").contains_key(&window));
     }
 
     #[test]
