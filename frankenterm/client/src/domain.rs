@@ -1528,34 +1528,42 @@ impl ClientInner {
         self.local_to_remote_window(local_window_id)
     }
 
-    /// A live local window in `workspace` that already shows a tab of
+    /// A live local window that already shows a tab of this attachment's
     /// `remote_window_id`, using the tab owners of the snapshot being
     /// applied. This is the reverse of [`Self::remote_window_for_local_window`].
-    /// The lowest window id wins so repeated resyncs pick the same window.
+    /// The match is by attachment and remote window identity only, never by
+    /// workspace: a workspace mismatch must not split one server window into
+    /// two OS windows. The lowest window id wins so repeated resyncs pick the
+    /// same window. The flag says whether that window shows nothing but tabs
+    /// of `remote_window_id`, so its workspace may follow the server's.
     fn live_window_showing_remote_window(
         &self,
         mux: &Mux,
         remote_window_id: WindowId,
         remote_tab_owners: &HashMap<TabId, WindowId>,
-        workspace: Option<&str>,
-    ) -> Option<WindowId> {
+    ) -> Option<(WindowId, bool)> {
         let mut windows = mux.iter_windows();
         windows.sort_unstable();
         for local_window_id in windows {
             // Copy tab ids under the `mux.windows` read guard and release it
             // before taking any other lock.
-            let local_tab_ids = match mux.get_window(local_window_id) {
-                Some(window) if workspace.is_none_or(|name| window.get_workspace() == name) => {
-                    window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>()
-                }
-                _ => continue,
+            let Some(local_tab_ids) = mux
+                .get_window(local_window_id)
+                .map(|window| window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>())
+            else {
+                continue;
             };
-            if local_tab_ids.into_iter().any(|local_tab_id| {
-                self.local_to_remote_tab(local_tab_id)
-                    .and_then(|remote_tab_id| remote_tab_owners.get(&remote_tab_id))
-                    == Some(&remote_window_id)
-            }) {
-                return Some(local_window_id);
+            let owners: Vec<_> = local_tab_ids
+                .into_iter()
+                .map(|local_tab_id| {
+                    self.local_to_remote_tab(local_tab_id)
+                        .and_then(|remote_tab_id| remote_tab_owners.get(&remote_tab_id))
+                        .copied()
+                })
+                .collect();
+            if owners.contains(&Some(remote_window_id)) {
+                let only_this_window = owners.iter().all(|owner| *owner == Some(remote_window_id));
+                return Some((local_window_id, only_this_window));
             }
         }
         None
@@ -5027,12 +5035,9 @@ impl ClientDomain {
                 // local window briefly holds no panes of this domain. Put the
                 // tab next to its siblings instead of opening a new window,
                 // and record the mapping again.
-                if let Some(local_window_id) = inner.live_window_showing_remote_window(
-                    mux,
-                    remote_window_id,
-                    &remote_tab_owners,
-                    workspace.as_deref(),
-                ) {
+                if let Some((local_window_id, only_this_window)) = inner
+                    .live_window_showing_remote_window(mux, remote_window_id, &remote_tab_owners)
+                {
                     log::debug!(
                         "domain {}: remote window {} reuses local window {} that shows its tabs",
                         inner.local_domain_id,
@@ -5041,6 +5046,27 @@ impl ClientDomain {
                     );
                     inner.record_remote_to_local_window_mapping(remote_window_id, local_window_id);
                     mux.add_tab_to_window(&tab, local_window_id)?;
+                    // The whole group follows the server's workspace, so the
+                    // tabs stay together. A window that also shows other
+                    // server windows keeps its workspace: moving it would
+                    // drag those along.
+                    if let Some(server_workspace) = workspace.as_deref() {
+                        let differs = mux
+                            .get_window(local_window_id)
+                            .is_some_and(|window| window.get_workspace() != server_workspace);
+                        if differs && only_this_window {
+                            if let Err(error) =
+                                mux.set_window_workspace(local_window_id, server_workspace)
+                            {
+                                log::warn!(
+                                    "domain {}: could not move local window {} to server workspace {:?}: {error:#}",
+                                    inner.local_domain_id,
+                                    local_window_id,
+                                    server_workspace
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -8366,6 +8392,40 @@ mod tests {
         let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
         assert_eq!(mux.window_containing_tab(new_tab_id), Some(window_id));
         assert_eq!(mux.iter_windows(), vec![window_id]);
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+    }
+
+    #[test]
+    fn expired_mapping_with_a_workspace_mismatch_does_not_split_the_server_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_041);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window_id = inner.remote_to_local_window(41).expect("window maps");
+        // The GUI shows the server window in workspace B, the server says
+        // "ops", and the mapping has expired.
+        mux.set_window_workspace(window_id, "other")
+            .expect("move the local window to another workspace");
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").remove(&41);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_new_tab_53_first(41),
+            None,
+        )
+        .expect("resync should apply");
+
+        assert_eq!(mux.iter_windows(), vec![window_id], "no new OS window");
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(window_id));
+        assert_eq!(
+            mux.get_window(window_id).expect("window").get_workspace(),
+            "ops",
+            "the whole group follows the server's workspace"
+        );
         assert_eq!(inner.remote_to_local_window(41), Some(window_id));
     }
 
