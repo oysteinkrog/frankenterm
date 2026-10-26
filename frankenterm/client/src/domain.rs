@@ -2177,17 +2177,19 @@ impl ClientInner {
     }
 
     /// Record one more resync requested for `local_window_id`'s order and
-    /// return how many were requested before this one.
-    fn note_order_resync_request(&self, local_window_id: WindowId) -> u8 {
+    /// return how many were requested before this one. `None` when the
+    /// bookkeeping is full: the caller must treat that as an exhausted
+    /// budget, never as a fresh one.
+    fn note_order_resync_request(&self, local_window_id: WindowId) -> Option<u8> {
         let mut requests =
             lock_or_recover(&self.order_resync_requests, "order_resync_requests");
         if requests.len() >= 4_096 && !requests.contains_key(&local_window_id) {
-            return u8::MAX;
+            return None;
         }
         let count = requests.entry(local_window_id).or_insert(0);
         let before = *count;
         *count = count.saturating_add(1);
-        before
+        Some(before)
     }
 
     fn clear_order_resync_requests(&self, local_window_id: WindowId) {
@@ -2925,6 +2927,22 @@ fn drain_windows_waiting_on_order_resync(
     }
 }
 
+/// Clears a window's resync count when its order commit ends, on every
+/// path, unless the window was deferred to another resync and keeps it.
+struct OrderRetryBudget<'a> {
+    inner: &'a ClientInner,
+    local_window_id: WindowId,
+    keep: bool,
+}
+
+impl Drop for OrderRetryBudget<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.inner.clear_order_resync_requests(self.local_window_id);
+        }
+    }
+}
+
 /// Whether a commit named a remote tab the server no longer knows. A tab
 /// moved on the server gets a new remote tab id, and the local mapping only
 /// learns it at the next resync, so such a commit is retried after it.
@@ -2948,6 +2966,13 @@ async fn run_window_order_commits(
 ) {
     let local_window_id = pending.local_window_id;
     let mut immediate_retries = 0u8;
+    // A fixed budget for this run, whatever the shared bookkeeping says.
+    let mut resyncs_this_run = 0u8;
+    let mut budget = OrderRetryBudget {
+        inner: &inner,
+        local_window_id,
+        keep: false,
+    };
     loop {
         if !client_attachment_is_current(&mux, domain_id, &inner) {
             return;
@@ -2996,7 +3021,8 @@ async fn run_window_order_commits(
                     )
                     .get(&local_window_id)
                     .copied()
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .max(resyncs_this_run);
                     match order_retry_action(
                         generation_at_read,
                         inner.topology_generation(),
@@ -3011,7 +3037,13 @@ async fn run_window_order_commits(
                             log::debug!(
                                 "tab order for window {local_window_id} waits for a resync: {outcome:?}"
                             );
-                            inner.note_order_resync_request(local_window_id);
+                            resyncs_this_run = resyncs_this_run.saturating_add(1);
+                            if inner.note_order_resync_request(local_window_id).is_none() {
+                                log::warn!(
+                                    "tab order for window {local_window_id} was not committed: too many windows wait for a resync"
+                                );
+                                return;
+                            }
                             // Our own pending entry would swallow the deferred
                             // re-run, so retry in this task after our resync.
                             if resync_for_window_order(&mux, domain_id, &inner).await {
@@ -3019,20 +3051,19 @@ async fn run_window_order_commits(
                             }
                             // Another resync is running and re-runs deferred
                             // windows when it finishes, success or failure;
-                            // this task ends first.
+                            // this task ends first and keeps its count.
                             inner.defer_window_order(local_window_id);
+                            budget.keep = true;
                             return;
                         }
                         OrderRetry::GiveUp => {
                             log::warn!(
                                 "tab order for window {local_window_id} was not committed: the server still does not know a tab after resyncs ({outcome:?})"
                             );
-                            inner.clear_order_resync_requests(local_window_id);
                             return;
                         }
                     }
                 }
-                inner.clear_order_resync_requests(local_window_id);
                 match &outcome {
                     WindowOrderCommitOutcome::Applied { .. } => {}
                     WindowOrderCommitOutcome::Unchanged { .. } => {}
@@ -6865,10 +6896,11 @@ mod tests {
         );
 
         let inner = test_client_inner(91_040);
-        assert_eq!(inner.note_order_resync_request(18), 0);
-        assert_eq!(inner.note_order_resync_request(18), 1);
+        assert_eq!(inner.note_order_resync_request(18), Some(0));
+        assert_eq!(inner.note_order_resync_request(18), Some(1));
         inner.clear_order_resync_requests(18);
-        assert_eq!(inner.note_order_resync_request(18), 0);
+        assert_eq!(inner.note_order_resync_request(18), Some(0));
+        inner.clear_order_resync_requests(18);
         inner.defer_window_order(18);
         inner.defer_window_order(17);
         inner.defer_window_order(18);
@@ -6888,7 +6920,7 @@ mod tests {
         let gone = usize::MAX - 1;
         inner.defer_window_order(window);
         inner.defer_window_order(gone);
-        assert_eq!(inner.note_order_resync_request(gone), 0);
+        assert_eq!(inner.note_order_resync_request(gone), Some(0));
 
         // The resync failed: the waiting windows are re-run anyway, and a
         // window that no longer exists gives up and frees its count.
@@ -6898,10 +6930,44 @@ mod tests {
 
         // With the domain gone, every waiting window gives up.
         inner.defer_window_order(window);
-        assert_eq!(inner.note_order_resync_request(window), 0);
+        assert_eq!(inner.note_order_resync_request(window), Some(0));
         drain_windows_waiting_on_order_resync(&mux, &inner, None);
         assert!(inner.take_deferred_window_orders().is_empty());
         assert!(!lock_or_recover(&inner.order_resync_requests, "test").contains_key(&window));
+    }
+
+    #[test]
+    fn order_retry_bookkeeping_fails_closed_and_is_cleared_on_every_end() {
+        let inner = test_client_inner(91_044);
+        // A full map is an exhausted budget, never a fresh one.
+        {
+            let mut requests = lock_or_recover(&inner.order_resync_requests, "test");
+            for window in 0..4_096 {
+                requests.insert(window, 1);
+            }
+        }
+        assert_eq!(inner.note_order_resync_request(1_000_000), None);
+        assert_eq!(inner.note_order_resync_request(5), Some(1), "known windows still count");
+        lock_or_recover(&inner.order_resync_requests, "test").clear();
+
+        // Any end of a commit run frees the count; only a deferral keeps it.
+        inner.note_order_resync_request(7);
+        drop(OrderRetryBudget {
+            inner: &inner,
+            local_window_id: 7,
+            keep: false,
+        });
+        assert!(!lock_or_recover(&inner.order_resync_requests, "test").contains_key(&7));
+        inner.note_order_resync_request(8);
+        drop(OrderRetryBudget {
+            inner: &inner,
+            local_window_id: 8,
+            keep: true,
+        });
+        assert_eq!(
+            lock_or_recover(&inner.order_resync_requests, "test").get(&8),
+            Some(&1)
+        );
     }
 
     #[test]
