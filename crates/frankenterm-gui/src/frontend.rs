@@ -67,6 +67,27 @@ use frankenterm_client::domain::{ClientDomain, RemoteLayoutSnapshot};
 type LayoutUpdates = Vec<(Option<u64>, MixedDomainLayoutOverlay)>;
 type LayoutDeletes = Vec<(LayoutWindowId, u64)>;
 
+/// Pull refusals from the storage worker and roll the lifecycle back to the
+/// store for those overlays. Revisions only advance for mutations the store
+/// accepted.
+fn sync_rejected_layout_overlays(lifecycle: &mut LayoutLifecycle) {
+    let rejected = crate::window_state_persist::take_rejected_layout_overlays();
+    if rejected.is_empty() {
+        return;
+    }
+    match crate::window_state_persist::load_layout_state() {
+        Ok(durable) => lifecycle.resync_rejected_overlays(&rejected, &durable),
+        Err(error) => {
+            log::warn!("could not reload the saved layout after a refused update: {error:?}");
+            // Forget the refused overlays rather than build on revisions
+            // that never landed.
+            lifecycle
+                .owned
+                .retain(|_, owned| !rejected.contains(&owned.overlay.window_id()));
+        }
+    }
+}
+
 fn queue_layout_changes(updates: LayoutUpdates, deletes: LayoutDeletes) -> anyhow::Result<()> {
     crate::window_state_persist::queue_layout_overlay_changes(updates, deletes).map_err(Into::into)
 }
@@ -247,8 +268,12 @@ impl LayoutLifecycle {
                     continue;
                 }
             } else if slots.iter().all(|slot| slot.remote_binding().is_some()) {
-                if old.is_some() {
-                    self.owned.remove(&id);
+                // The overlay no longer describes a window with local tabs.
+                // Delete it in this batch, so its stale claims on tabs that
+                // moved elsewhere cannot block the windows that took them.
+                if let Some(old) = old {
+                    deletes.push((old.overlay.window_id(), old.overlay.local_revision()));
+                    retired.push(id);
                 }
                 continue;
             }
@@ -296,6 +321,45 @@ impl LayoutLifecycle {
                 },
             ));
         }
+        // An update may claim a tab that an inert overlay still lists: one
+        // whose window is gone, or a restored startup overlay nobody owns.
+        // The store refuses such a claim on its own, so release the old
+        // claim in the same batch. Overlays nothing claims are left alone,
+        // which keeps every layout across quit and disconnect.
+        let claimed: std::collections::HashSet<_> = updates
+            .iter()
+            .flat_map(|(_, overlay)| overlay.slots().iter().map(|slot| slot.identity()))
+            .collect();
+        let claims_updated_tab = |overlay: &MixedDomainLayoutOverlay| {
+            overlay
+                .slots()
+                .iter()
+                .any(|slot| claimed.contains(&slot.identity()))
+        };
+        let mut released = Vec::new();
+        for (&id, owned) in &self.owned {
+            let window_is_live = mux
+                .get_window(id)
+                .is_some_and(|window| window.durable_id() == owned.mux_identity);
+            if !window_is_live && !retired.contains(&id) && claims_updated_tab(&owned.overlay) {
+                released.push((owned.overlay.window_id(), owned.overlay.local_revision()));
+                retired.push(id);
+            }
+        }
+        for overlay in &self.startup.overlays {
+            let inert = self.restored.contains(&overlay.window_id())
+                && !self
+                    .owned
+                    .values()
+                    .any(|owned| owned.overlay.window_id() == overlay.window_id());
+            if inert
+                && claims_updated_tab(overlay)
+                && !deletes.iter().any(|(id, _)| *id == overlay.window_id())
+            {
+                released.push((overlay.window_id(), overlay.local_revision()));
+            }
+        }
+        deletes.extend(released);
         if updates.is_empty() && deletes.is_empty() {
             return Ok(());
         }
@@ -323,6 +387,38 @@ impl LayoutLifecycle {
             self.owned.insert(id, owned);
         }
         Ok(())
+    }
+
+    /// The store refused queued mutations of `rejected`. Reset their
+    /// bookkeeping to what the store holds, so the next capture builds on the
+    /// committed revision instead of one that never landed. An overlay the
+    /// store does not hold is forgotten, and its window gets a new one.
+    fn resync_rejected_overlays(
+        &mut self,
+        rejected: &std::collections::BTreeSet<LayoutWindowId>,
+        durable: &LayoutStateSnapshot,
+    ) {
+        self.owned.retain(|_, owned| {
+            let id = owned.overlay.window_id();
+            if !rejected.contains(&id) {
+                return true;
+            }
+            match durable.overlay(id) {
+                Some(stored) => {
+                    owned.overlay = stored.clone();
+                    true
+                }
+                None => false,
+            }
+        });
+        self.startup
+            .overlays
+            .retain(|overlay| !rejected.contains(&overlay.window_id()));
+        for &id in rejected {
+            if let Some(stored) = durable.overlay(id) {
+                self.startup.overlays.push(stored.clone());
+            }
+        }
     }
 
     fn restore(&mut self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<()> {
@@ -779,6 +875,7 @@ impl GuiFrontEnd {
             let Some(lifecycle) = lifecycle.as_mut() else {
                 return Ok(());
             };
+            sync_rejected_layout_overlays(lifecycle);
             let live = LiveLayout::capture(&mux, &lifecycle.startup)?;
             if restore {
                 lifecycle.restore(&mux, &live)
@@ -808,6 +905,7 @@ impl GuiFrontEnd {
             let Some(lifecycle) = lifecycle.as_mut() else {
                 return Ok(());
             };
+            sync_rejected_layout_overlays(lifecycle);
             let live = LiveLayout::capture(&mux, &lifecycle.startup)?;
             lifecycle.capture_and_retire(&mux, &live, windows, queue_layout_changes)
         })();
@@ -2114,14 +2212,156 @@ mod tests {
                 overlay,
             },
         );
-        // Dropping ownership writes nothing.
+        // The overlay is deleted at its owned revision, so its claims go
+        // with it, and nothing else is written.
         lifecycle
             .capture_and_retire(&mux, &live, &[], |updates, deletes| {
-                assert!(updates.is_empty() && deletes.is_empty());
+                assert!(updates.is_empty());
+                assert_eq!(deletes, vec![(overlay_id, 4)]);
                 Ok(())
             })
             .unwrap();
         assert!(lifecycle.owned.is_empty());
+        assert!(lifecycle.startup.overlay(overlay_id).is_none());
+    }
+
+    #[test]
+    fn a_window_left_with_only_remote_tabs_releases_its_claims_in_the_receivers_batch() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow};
+        use std::sync::{Arc, Mutex};
+        // Window A shows local tab L and remote tab R. Window B shows local
+        // tab M. Moving L to B leaves A with only R.
+        let (mux, _activity, ids, tabs, mut live, mut startup, _temp) =
+            remote_layout_fixture(&[2]);
+        let window_a = ids[0];
+        let local_slot = |tab: &mux::tab::Tab| {
+            super::StableTabSlot::local(
+                super::StableLocalSessionId::from_bytes([5; 16]),
+                super::StableLocalTabId::from_bytes(*tab.durable_id().as_bytes()),
+            )
+        };
+        let slot_l = local_slot(&tabs[0]);
+        live.slots.insert(tabs[0].tab_id(), slot_l);
+        let slot_r = live.slots[&tabs[1].tab_id()];
+        let window_b_builder = mux.new_empty_window(None, None);
+        let window_b = *window_b_builder;
+        let tab_m = Arc::new(mux::tab::Tab::new(&Default::default()));
+        mux.add_tab_no_panes(&tab_m).unwrap();
+        mux.add_tab_to_window(&tab_m, window_b).unwrap();
+        let slot_m = local_slot(&tab_m);
+        live.slots.insert(tab_m.tab_id(), slot_m);
+
+        let overlay_a = MixedDomainLayoutOverlay::new(
+            startup.new_layout_window_id().unwrap(),
+            "default",
+            3,
+            vec![slot_l, slot_r],
+            Some(slot_l),
+        )
+        .unwrap();
+        let overlay_b = MixedDomainLayoutOverlay::new(
+            startup.new_layout_window_id().unwrap(),
+            "default",
+            1,
+            vec![slot_m],
+            Some(slot_m),
+        )
+        .unwrap();
+        // An inert overlay from an earlier run that still lists L.
+        let inert = MixedDomainLayoutOverlay::new(
+            startup.new_layout_window_id().unwrap(),
+            "default",
+            7,
+            vec![slot_l],
+            Some(slot_l),
+        )
+        .unwrap();
+        startup.overlays = vec![overlay_a.clone(), overlay_b.clone(), inert.clone()];
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+        };
+        for overlay in [&overlay_a, &overlay_b, &inert] {
+            lifecycle.restored.insert(overlay.window_id());
+        }
+        for (id, overlay) in [(window_a, &overlay_a), (window_b, &overlay_b)] {
+            lifecycle.owned.insert(
+                id,
+                OwnedLayoutWindow {
+                    mux_identity: mux.get_window(id).unwrap().durable_id(),
+                    overlay: overlay.clone(),
+                },
+            );
+        }
+
+        mux.move_tab_between_windows(tabs[0].tab_id(), window_b, None)
+            .unwrap();
+        let recorded = Mutex::new(None);
+        lifecycle
+            .capture_and_retire(&mux, &live, &[], |updates, deletes| {
+                *recorded.lock().unwrap() = Some((updates, deletes));
+                Ok(())
+            })
+            .unwrap();
+        let (updates, mut deletes) = recorded.into_inner().unwrap().unwrap();
+        deletes.sort();
+        let mut expected = vec![(overlay_a.window_id(), 3), (inert.window_id(), 7)];
+        expected.sort();
+        assert_eq!(deletes, expected, "stale claims on L go in the same batch");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, Some(1));
+        assert_eq!(updates[0].1.window_id(), overlay_b.window_id());
+        assert!(updates[0].1.slots().contains(&slot_l));
+        assert!(!lifecycle.owned.contains_key(&window_a));
+        assert!(lifecycle.startup.overlay(overlay_a.window_id()).is_none());
+        assert!(lifecycle.startup.overlay(inert.window_id()).is_none());
+        window_b_builder.cancel();
+    }
+
+    #[test]
+    fn a_refused_update_rolls_the_lifecycle_back_to_the_stored_revision() {
+        use super::{LayoutLifecycle, MixedDomainLayoutOverlay, OwnedLayoutWindow};
+        let (mux, _activity, ids, tabs, live, mut startup, _temp) = remote_layout_fixture(&[2]);
+        let slot = live.slots[&tabs[0].tab_id()];
+        let kept_id = startup.new_layout_window_id().unwrap();
+        let lost_id = startup.new_layout_window_id().unwrap();
+        let stored = MixedDomainLayoutOverlay::new(kept_id, "default", 4, vec![slot], Some(slot))
+            .unwrap();
+        let mut durable = startup.clone();
+        durable.overlays = vec![stored.clone()];
+        let ahead = MixedDomainLayoutOverlay::new(kept_id, "default", 5, vec![slot], Some(slot))
+            .unwrap();
+        let never_stored =
+            MixedDomainLayoutOverlay::new(lost_id, "default", 1, vec![slot], Some(slot)).unwrap();
+        startup.overlays = vec![ahead.clone()];
+        let identity = mux.get_window(ids[0]).unwrap().durable_id();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: Default::default(),
+            restored: Default::default(),
+        };
+        lifecycle.owned.insert(
+            ids[0],
+            OwnedLayoutWindow {
+                mux_identity: identity,
+                overlay: ahead,
+            },
+        );
+        lifecycle.owned.insert(
+            usize::MAX,
+            OwnedLayoutWindow {
+                mux_identity: identity,
+                overlay: never_stored,
+            },
+        );
+        lifecycle.resync_rejected_overlays(
+            &std::collections::BTreeSet::from([kept_id, lost_id]),
+            &durable,
+        );
+        assert_eq!(lifecycle.owned[&ids[0]].overlay, stored);
+        assert!(!lifecycle.owned.contains_key(&usize::MAX));
+        assert_eq!(lifecycle.startup.overlays, vec![stored]);
     }
 
     #[test]

@@ -1774,6 +1774,9 @@ struct CoordinatorPending {
     binding_waiters: BTreeMap<PrivacySafeTargetFingerprint, Vec<flume::Sender<BindingResult>>>,
     waiter_count: usize,
     unreported_semantic_failure: Option<SemanticFailureOutcome>,
+    /// Overlays whose queued mutation the worker refused since the GUI last
+    /// asked. The GUI then resets its revision bookkeeping to the store.
+    rejected_overlay_ids: BTreeSet<LayoutWindowId>,
     #[cfg(test)]
     worker_commit_control: Option<TestWorkerCommitControl>,
 }
@@ -1913,6 +1916,11 @@ impl PersistenceWriter {
         self.wake_worker()?;
         pending.batch = next;
         Ok(())
+    }
+
+    /// The overlays whose mutation the worker refused since the last call.
+    pub fn take_rejected_overlays(&self) -> BTreeSet<LayoutWindowId> {
+        std::mem::take(&mut lock_pending(&self.shared.pending).rejected_overlay_ids)
     }
 
     pub fn queue_overlay_delete(
@@ -2190,6 +2198,11 @@ fn acknowledge_committed_batch(
             &rejected_overlay_ids,
             &binding_requests_after_snapshot,
         );
+        if pending.rejected_overlay_ids.len() < MAX_LAYOUT_OVERLAYS {
+            pending
+                .rejected_overlay_ids
+                .extend(rejected_overlay_ids.iter().copied());
+        }
         semantic_failure.map(|failure| pending.record_semantic_failure(failure))
     };
 
@@ -7337,6 +7350,15 @@ pub fn queue_layout_overlay_changes(
     deletes: Vec<(LayoutWindowId, u64)>,
 ) -> Result<(), PersistenceFailure> {
     global_writer()?.queue_overlay_changes(overlays, deletes)
+}
+
+/// The overlays the default worker refused since the last call. Empty when
+/// no writer was started, so it never opens the store by itself.
+pub fn take_rejected_layout_overlays() -> BTreeSet<LayoutWindowId> {
+    match GLOBAL_WRITER.get() {
+        Some(Ok(writer)) => writer.take_rejected_overlays(),
+        _ => BTreeSet::new(),
+    }
 }
 
 /// Queue retirement of one exact live overlay revision on the default worker.
@@ -16057,6 +16079,12 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("flush response")
             .expect_err("the store refuses a claim on a tab another window owns");
+        assert_eq!(
+            writer.take_rejected_overlays(),
+            BTreeSet::from([receiver]),
+            "the GUI learns which overlay was refused"
+        );
+        assert!(writer.take_rejected_overlays().is_empty());
         let after_claim = load_snapshot_at(&path).expect("load");
         assert!(after_claim.overlay(emptied).is_some());
         assert!(
